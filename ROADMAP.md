@@ -130,6 +130,7 @@ Trabajar primero en macOS/Linux, donde depurar es barato. Usar PPSSPP como orác
   - DoD: se ven los logos de Konami / pantalla de título. *(logo de KONAMI con fundido, vblank ~700, licencias JFA y **pantalla de título en español** "PULSAR CUALQUIER BOTÓN" hacia vblank 1700; en el Mac corre ~10x más rápido que una PSP sin limitador; ventana SDL2 en `display_window_sdl.cpp`; diálogos del sistema y OSK con respuesta automática; vídeo de intro saltado con un override de la rutina de reproducción `0x088217C4`)*
 - [ ] **4c. Menús e input:** `sceCtrl` mapeado a teclado/mando SDL; navegación de menús.
   - DoD: se puede llegar a "Partido amistoso" y elegir equipos.
+  - *Estado:* título → START → `select.ovl`/`select1.ovl`; primera vez: diálogos del sistema (Archivo de Opciones creado) y pantalla **"Nivel de juego"** con texto correcto. Tras elegir nivel, el menú principal muestra fondo + logos pero **no envía los elementos del menú a la GPU** (solo ~20 primitivas/fotograma); en investigación (comparar con PPSSPP).
 - [ ] **4d. Partido jugable:** arreglar VFPU, rasterizado (geometría transformada, texturas, blending, depth), timing de vblank.
   - DoD: un partido completo de principio a fin sin crashear; comparar capturas con PPSSPP.
 - [ ] **4e. Audio:** `sceAudio`/`sceSas` para efectos; música/comentarios (probablemente ATRAC3 → decodificar con ffmpeg como hace VCS).

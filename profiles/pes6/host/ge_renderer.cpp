@@ -2639,7 +2639,10 @@ FragmentSetup make_fragment_setup(const std::array<std::uint32_t, 256> &commands
     setup.depth_base = depthbuffer_address(commands);
     setup.depth_test_enabled = (data24(commands[0x23u]) & 1u) != 0u;
     setup.depth_function = data24(commands[0xDEu]) & 7u;
-    setup.depth_write_enabled = (data24(commands[0xE7u]) & 1u) == 0u;
+    // The GE only updates the depth buffer while the depth test is enabled;
+    // with ZTE off, ZMSK is irrelevant and nothing is written. PES6's menu
+    // draws a full-screen 2D background with the test off before its widgets.
+    setup.depth_write_enabled = setup.depth_test_enabled && (data24(commands[0xE7u]) & 1u) == 0u;
     const std::uint32_t blend_mode = data24(commands[0xDFu]);
     setup.blend_enabled = (data24(commands[0x21u]) & 1u) != 0u;
     setup.blend_equation = (blend_mode >> 8u) & 7u;
@@ -2975,6 +2978,8 @@ void rasterize_rectangle(psprecomp::GuestMemory &memory,
             for (unsigned index = 0u; index < slots; ++index) {
                 stats.pixels_tested += partial[index].pixels_tested;
                 stats.pixels_written += partial[index].pixels_written;
+                stats.pixels_alpha_rejected += partial[index].pixels_alpha_rejected;
+                stats.pixels_depth_rejected += partial[index].pixels_depth_rejected;
             }
         };
         if (phase_diag) {
@@ -3007,10 +3012,10 @@ void rasterize_rectangle(psprecomp::GuestMemory &memory,
                 const float v = (a.v + (b.v - a.v) * ty) / q;
                 source = apply_texture_function(source, sample_texture(memory, setup.texture, u, v), setup);
             }
-            if (!clear_mode && !alpha_test(source, setup)) continue;
+            if (!clear_mode && !alpha_test(source, setup)) { ++row_stats.pixels_alpha_rejected; continue; }
             const float zf = static_cast<float>(a.z) + (static_cast<float>(b.z) - a.z) * ((tx + ty) * 0.5f);
             const std::uint16_t z = static_cast<std::uint16_t>(std::clamp(zf, 0.0f, 65535.0f));
-            if (!depth_test_and_write(memory, setup, x, y, z, clear_mode && clear_depth)) continue;
+            if (!depth_test_and_write(memory, setup, x, y, z, clear_mode && clear_depth)) { ++row_stats.pixels_depth_rejected; continue; }
 
             const std::size_t pixel_index =
                 static_cast<std::size_t>(y) * framebuffer_stride + static_cast<std::size_t>(x);
@@ -3060,6 +3065,8 @@ void rasterize_rectangle(psprecomp::GuestMemory &memory,
         const GeRenderStats &item = partial[index];
         stats.pixels_tested += item.pixels_tested;
         stats.pixels_written += item.pixels_written;
+        stats.pixels_alpha_rejected += item.pixels_alpha_rejected;
+        stats.pixels_depth_rejected += item.pixels_depth_rejected;
     }
 }
 
@@ -3222,7 +3229,9 @@ bool fragment_depth_prepass(psprecomp::GuestMemory &memory, const FragmentSetup 
     }
     ++stats.pixels_tested;
     const std::uint16_t z = static_cast<std::uint16_t>(std::clamp(zf, 0.0f, 65535.0f));
-    return depth_test_and_write(memory, setup, x, y, z, setup.clear_mode && setup.clear_depth);
+    const bool passed = depth_test_and_write(memory, setup, x, y, z, setup.clear_mode && setup.clear_depth);
+    if (!passed) ++stats.pixels_depth_rejected;
+    return passed;
 }
 
 // `depth_resolved` says the caller already ran fragment_depth_prepass for this
@@ -3251,15 +3260,19 @@ bool write_fragment(psprecomp::GuestMemory &memory,
     // fragments are occluded and end up discarded by the depth test anyway.
     const bool depth_before_shading = depth_resolved || depth_precedes_shading(setup);
     if (!depth_resolved && depth_before_shading &&
-        !depth_test_and_write(memory, setup, x, y, z, setup.clear_mode && setup.clear_depth))
+        !depth_test_and_write(memory, setup, x, y, z, setup.clear_mode && setup.clear_depth)) {
+        ++stats.pixels_depth_rejected;
         return false;
+    }
 
     if (setup.texture_enabled && !setup.clear_mode)
         source = apply_texture_function(source, sample_texture(memory, setup.texture, u, v), setup);
-    if (!setup.clear_mode && !alpha_test(source, setup)) return false;
+    if (!setup.clear_mode && !alpha_test(source, setup)) { ++stats.pixels_alpha_rejected; return false; }
     if (!depth_before_shading &&
-        !depth_test_and_write(memory, setup, x, y, z, setup.clear_mode && setup.clear_depth))
+        !depth_test_and_write(memory, setup, x, y, z, setup.clear_mode && setup.clear_depth)) {
+        ++stats.pixels_depth_rejected;
         return false;
+    }
 
     const std::size_t pixel_index =
         static_cast<std::size_t>(y) * setup.framebuffer_stride + static_cast<std::size_t>(x);
@@ -3790,6 +3803,8 @@ void rasterize_prepared_triangles(psprecomp::GuestMemory &memory,
     for (unsigned index = 0u; index < slots; ++index) {
         stats.pixels_tested += partial[index].pixels_tested;
         stats.pixels_written += partial[index].pixels_written;
+        stats.pixels_alpha_rejected += partial[index].pixels_alpha_rejected;
+        stats.pixels_depth_rejected += partial[index].pixels_depth_rejected;
     }
 }
 

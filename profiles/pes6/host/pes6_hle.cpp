@@ -3589,6 +3589,8 @@ bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
                               << " ztest=" << (ge_state.commands[0x23u] & 1u)
                               << " cull=" << (ge_state.commands[0x1Du] & 1u)
                               << " tested=" << render_stats.pixels_tested
+                              << " alpha_rej=" << render_stats.pixels_alpha_rejected
+                              << " depth_rej=" << render_stats.pixels_depth_rejected
                               << " written=" << render_stats.pixels_written
                               << " tris=" << render_stats.triangles
                               << " culled=" << render_stats.culled_triangles
@@ -3641,6 +3643,8 @@ bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
                               << " culled=" << render_stats.culled_triangles
                               << " flat=" << render_stats.flat_shaded_primitives
                               << " tested=" << render_stats.pixels_tested
+                              << " alpha_rej=" << render_stats.pixels_alpha_rejected
+                              << " depth_rej=" << render_stats.pixels_depth_rejected
                               << " written=" << render_stats.pixels_written
                               << " unsupported=" << render_stats.unsupported_primitives
                               << "\n";
@@ -6767,6 +6771,14 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             } else if (savedata_utility.status == UtilityStatus::Visible && !savedata_utility.operation_complete) {
                 const std::uint32_t result = execute_savedata_operation(rt, savedata_utility.parameter_address);
                 rt.memory().store32(savedata_utility.parameter_address + kUtilityCommonResultOffset, result);
+                {
+                    const std::uint32_t parameter = savedata_utility.parameter_address;
+                    runtime_log_line("[savedata] mode=" + std::to_string(rt.memory().load32(parameter + kSavedataModeOffset)) +
+                                     " game=" + read_fixed_string(rt.memory(), parameter + kSavedataGameNameOffset, 13u) +
+                                     " save=" + read_fixed_string(rt.memory(), parameter + kSavedataSaveNameOffset, 20u) +
+                                     " file=" + read_fixed_string(rt.memory(), parameter + kSavedataFileNameOffset, 13u) +
+                                     " -> " + psprecomp::hex32(result));
+                }
                 savedata_utility.operation_complete = true;
                 savedata_utility.status = UtilityStatus::Quit;
                 if (std::getenv("PSPRECOMP_TRACE") != nullptr) {

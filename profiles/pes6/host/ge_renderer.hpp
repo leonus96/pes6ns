@@ -49,6 +49,9 @@ struct GeRenderStats {
     std::uint64_t flat_shaded_primitives{};
     std::uint64_t pixels_tested{};
     std::uint64_t pixels_written{};
+    // Fragments discarded by the alpha / depth tests (diagnostics).
+    std::uint64_t pixels_alpha_rejected{};
+    std::uint64_t pixels_depth_rejected{};
     std::uint64_t unsupported_primitives{};
     std::uint64_t decoded_vertices{};
     std::uint64_t nonfinite_clip_vertices{};

@@ -980,6 +980,21 @@ int PSPRECOMP_TESTS_ENTRY() {
         const auto vi2f = psprecomp::decode_allegrex(0xD2830182u);
         require(vi2f.kind == psprecomp::OpcodeKind::Vi2f && vi2f.mnemonic == "vi2f",
                 "VI2F.P classification failed");
+        {
+            const auto vi2uc = psprecomp::decode_allegrex(0xD03C8080u);
+            require(vi2uc.kind == psprecomp::OpcodeKind::Vi2x && vi2uc.mnemonic == "vi2uc",
+                    "VI2UC.Q classification failed");
+            psprecomp::AllegrexContext vctx{};
+            vctx.vfpu_ctrl[0] = 0xE4u; vctx.vfpu_ctrl[1] = 0xE4u; vctx.vfpu_ctrl[2] = 0u;
+            const std::int32_t lanes[4]{0x7F800000, -5, 0x00800000, 0x40000000};
+            float in[4];
+            for (int i = 0; i < 4; ++i) in[i] = std::bit_cast<float>(static_cast<std::uint32_t>(lanes[i]));
+            vctx.write_vfpu_vector_with_destination_prefix(in, 0u, 4u);
+            vctx.execute_vfpu_vi2x(32u, 0u, 4u, 0u);
+            float out[1]{};
+            vctx.read_vfpu_vector(out, 32u, 1u);
+            require(std::bit_cast<std::uint32_t>(out[0]) == 0x800100FFu, "VI2UC.Q packing failed");
+        }
         const auto vf2iz = psprecomp::decode_allegrex(0xD2202020u);
         require(vf2iz.kind == psprecomp::OpcodeKind::Vf2i && vf2iz.mnemonic == "vf2iz",
                 "VF2IZ.S classification failed");
