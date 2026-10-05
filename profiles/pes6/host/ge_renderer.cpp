@@ -2835,6 +2835,17 @@ Color blend_pixel(Color source, Color destination, const FragmentSetup &setup) n
     return {to8(out[0]),to8(out[1]),to8(out[2]),to8(out[3])};
 }
 
+// Interpolated depth -> 16-bit Z. Barycentric weights summing to 1 - epsilon
+// turned a constant Z of 2795 into 2794.9998, which truncation made 2794: 2D
+// UI quads drawn at one depth then failed the depth test on scattered pixels
+// (the "noise" in PES6's menu panels and flags). Values within float error of
+// an integer snap to it; anything else still truncates.
+inline std::uint16_t depth_from_float(float zf) {
+    const float clamped = std::clamp(zf, 0.0f, 65535.0f);
+    const float nearest = std::nearbyint(clamped);
+    return static_cast<std::uint16_t>(std::fabs(clamped - nearest) < (1.0f / 256.0f) ? nearest : clamped);
+}
+
 bool depth_test_and_write(psprecomp::GuestMemory &memory, const FragmentSetup &setup,
                           std::int32_t x, std::int32_t y, std::uint16_t z,
                           bool clear_depth) {
@@ -3014,7 +3025,7 @@ void rasterize_rectangle(psprecomp::GuestMemory &memory,
             }
             if (!clear_mode && !alpha_test(source, setup)) { ++row_stats.pixels_alpha_rejected; continue; }
             const float zf = static_cast<float>(a.z) + (static_cast<float>(b.z) - a.z) * ((tx + ty) * 0.5f);
-            const std::uint16_t z = static_cast<std::uint16_t>(std::clamp(zf, 0.0f, 65535.0f));
+            const std::uint16_t z = depth_from_float(zf);
             if (!depth_test_and_write(memory, setup, x, y, z, clear_mode && clear_depth)) { ++row_stats.pixels_depth_rejected; continue; }
 
             const std::size_t pixel_index =
@@ -3228,7 +3239,7 @@ bool fragment_depth_prepass(psprecomp::GuestMemory &memory, const FragmentSetup 
         return false;
     }
     ++stats.pixels_tested;
-    const std::uint16_t z = static_cast<std::uint16_t>(std::clamp(zf, 0.0f, 65535.0f));
+    const std::uint16_t z = depth_from_float(zf);
     const bool passed = depth_test_and_write(memory, setup, x, y, z, setup.clear_mode && setup.clear_depth);
     if (!passed) ++stats.pixels_depth_rejected;
     return passed;
@@ -3253,7 +3264,7 @@ bool write_fragment(psprecomp::GuestMemory &memory,
         }
         ++stats.pixels_tested;
     }
-    const std::uint16_t z = static_cast<std::uint16_t>(std::clamp(zf, 0.0f, 65535.0f));
+    const std::uint16_t z = depth_from_float(zf);
 
     // Texture sampling is by far the most expensive step here -- with bilinear
     // filtering it decodes four texels per fragment -- and in a city scene most
@@ -3720,7 +3731,9 @@ void rasterize_prepared_triangle_rows(psprecomp::GuestMemory &memory,
                 texture_denominator = l0 * a.q * a.inv_w + l1 * b.q * b.inv_w + l2 * c.q * c.inv_w;
                 if (!finite_float(texture_denominator) || std::fabs(texture_denominator) < 1.0e-20f) continue;
             }
-            const float z = l0 * a.z + l1 * b.z + l2 * c.z;
+            // Relative to a.z so a constant-depth primitive (2D UI, Z near
+            // 65535 where one float ulp is already 1/256) interpolates exactly.
+            const float z = a.z + l1 * (b.z - a.z) + l2 * (c.z - a.z);
             if (triangle.early_depth &&
                 !fragment_depth_prepass(memory, setup, x, y, z, row_stats)) continue;
             float u = 0.0f;

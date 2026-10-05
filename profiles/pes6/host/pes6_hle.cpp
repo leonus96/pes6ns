@@ -952,6 +952,22 @@ std::uint32_t next_mpeg_stream_id{1u};
 std::array<AudioChannelState, 9> audio_channels{};
 std::uint64_t virtual_time_us{};
 
+// Microseconds since the Unix epoch for the guest's wall-clock imports (RTC,
+// libc time). With the host clock, two headless runs of the same route
+// diverged from the start of a match (likely the "Al azar" weather/season
+// draw); with a pinned clock they are bit-identical. PES6_FIXED_CLOCK=<unix
+// seconds> pins it to that instant plus the guest's virtual time.
+std::uint64_t wall_clock_unix_microseconds() {
+    static const std::optional<std::uint64_t> fixed = []() -> std::optional<std::uint64_t> {
+        const char *text = std::getenv("PES6_FIXED_CLOCK");
+        if (text == nullptr || *text == '\0') return std::nullopt;
+        return static_cast<std::uint64_t>(std::strtoull(text, nullptr, 0)) * 1000000ull;
+    }();
+    if (fixed) return *fixed + virtual_time_us;
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
 // The PSP display refreshes at 59.94 Hz. VCS exposed an unlocked frame rate
 // through its INI and a guest patch; PES6 keeps the stock refresh.
 constexpr std::uint32_t kDisplayRefreshHz = 60u;
@@ -4853,9 +4869,7 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
     // --- UtilsForUser libc time --------------------------------------------
     runtime.register_hle("UtilsForUser", 0x27CC57F0u, // sceKernelLibcTime
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
-            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            const auto value = static_cast<std::uint32_t>(now);
+            const auto value = static_cast<std::uint32_t>(wall_clock_unix_microseconds() / 1000000ull);
             if (ctx.gpr[4] != 0u && rt.memory().contains(ctx.gpr[4], 4u)) rt.memory().store32(ctx.gpr[4], value);
             ctx.set_gpr(2, value);
         });
@@ -4865,8 +4879,7 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
         });
     runtime.register_hle("UtilsForUser", 0x71EC4271u, // sceKernelLibcGettimeofday
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
-            const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
+            const std::uint64_t now = wall_clock_unix_microseconds();
             const std::uint32_t tv = ctx.gpr[4];
             if (tv != 0u && rt.memory().contains(tv, 8u)) {
                 rt.memory().store32(tv, static_cast<std::uint32_t>(now / 1000000));
@@ -8786,10 +8799,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         const auto current_tick = []() -> std::uint64_t {
             // The wall clock, not the guest's virtual time: a save stamped with
             // the emulated uptime would read as the year 1 in the list.
-            const auto now = std::chrono::system_clock::now().time_since_epoch();
-            const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
             return static_cast<std::uint64_t>(kDaysToUnixEpoch) * kMicrosecondsPerDay +
-                   static_cast<std::uint64_t>(micros);
+                   wall_clock_unix_microseconds();
         };
         static const auto tick_now = current_tick;
 
