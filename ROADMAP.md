@@ -121,7 +121,9 @@ Trabajar primero en macOS/Linux, donde depurar es barato. Usar PPSSPP como orác
 - [ ] **4a. Esqueleto:** crear `profiles/pes6/` según la guía; `CMakeLists.txt`; generar el corpus AOT con `psp_recomp` (o una herramienta propia del perfil si hace falta lowering específico); bootstrap de rutas (`PSP_DATA`, `USRDIR`).
   - DoD: el binario compila, enlaza y ejecuta hasta el primer `sceDisplaySetFrameBuf` en modo headless.
   - *Estado:* perfil creado (opción B: HLE de VCS copiado y podado en `profiles/pes6/host/`), corpus AOT generado (117 unidades de 16 KiB, 73 226 entradas), `PES6Native` compila y enlaza en macOS y ejecuta código de PES6 hasta el primer import sin HLE (`sceKernelGetModuleIdByAddress`). Arreglados 2 bugs de `psp_recomp` (bucle infinito en JAL→import; JAL a destinos sin unidad).
-  - **Hallazgo:** cientos de JAL a `0x08D1xxxx–0x08FCxxxx`, fuera del EBOOT (zona BSS) → PES6 carga **código en tiempo de ejecución** (overlays, probablemente desde `over.afs`). Habrá que extraerlos y recompilarlos.
+  - **Hallazgo confirmado:** el ELF declara ~40 overlays como secciones vacías con dirección de carga (`title.ovl`/`bootset.ovl`… en `0x08D17800`, `game.ovl`/`select.ovl`… en `0x08D4E800`, `masterleague.ovl`, `edit.ovl`…). Varios comparten dirección. El código vive en `over.afs` y se carga con lecturas `disc0:/sce_lbn…`.
+  - *Progreso del arranque (c8b31fd):* imprime su banner, inicializa sonido/hilos, recibe el aviso de UMD, lee las tablas de los `.afs`, carga el primer overlay en `0x08D17800` y unos 1,3 MB de datos; 62 vblanks; **se detiene en el primer código de overlay (`0x08D18E68`)**. Pantalla aún negra (el logo lo dibuja el overlay).
+  - **Siguiente bloque: soporte de overlays** (decisión pendiente con el usuario).
 - [ ] **4b. Primer frame:** completar HLE bloqueante (memoria, threads, IO, GE); presentar el framebuffer con SDL2 en escritorio.
   - DoD: se ven los logos de Konami / pantalla de título.
 - [ ] **4c. Menús e input:** `sceCtrl` mapeado a teclado/mando SDL; navegación de menús.
