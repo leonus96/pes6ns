@@ -28,7 +28,7 @@ Si la Ruta A se abre en algún momento, saltar directo a la Fase 5 adaptando su 
 - **Referencias, NO vincular:** PPSSPP (GPL) se usa solo como **oráculo** para comparar comportamiento. `uofw` (MIT) y `pspsdk` (BSD) como referencia de HLE/ABI. Evitar copiar código GPL (p. ej. de `sal063/PSP-recompilation-project`) salvo que se decida licenciar todo como GPL.
 
 ### Estado del repo (2026-10-04)
-- Clonado de `jessicanataliagta/PSPRecomp` (`f6e7d41`). Remotos: `upstream` (base) y `szczuru` (rama `switch-port`, solo lectura/referencia). Falta crear el fork propio en GitHub y apuntar `origin` a él.
+- Clonado de `jessicanataliagta/PSPRecomp` (`f6e7d41`). Remotos: `upstream` (base) y `szczuru` (rama `switch-port`, solo lectura/referencia). `origin` = fork propio [`leonus96/pes6ns`](https://github.com/leonus96/pes6ns) (público).
 - El repo será **público** → `profiles/pes6/generated/` está en `.gitignore`.
 
 ---
@@ -50,7 +50,7 @@ Si la Ruta A se abre en algún momento, saltar directo a la Fase 5 adaptando su 
 - [x] macOS (o Linux) con CMake ≥ 3.20, Ninja, clang con C++20. *(CMake 4.4.3, Ninja, Apple clang)*
 - [ ] devkitPro instalado + paquetes vía `dkp-pacman`: `switch-dev`, `switch-sdl2`, `switch-mesa`, `switch-ffmpeg` (si se necesita decodificar ATRAC3), `switch-tools`.
 - [ ] PPSSPP de escritorio (oráculo / comparación).
-- [x] Alternativa sin toolchain local: CI con la imagen Docker `devkitpro/devkita64`. *(workflow escrito; pendiente de primera ejecución)*
+- [x] Alternativa sin toolchain local: CI con la imagen Docker `devkitpro/devkita64`. *(CI en verde; también se puede compilar local con `docker run devkitpro/devkita64`)*
 
 ---
 
@@ -90,12 +90,12 @@ Cada fase tiene **tareas**, **criterio de terminado (DoD)** y **estimación** pa
 - [ ] Instalar devkitPro y compilar un ejemplo de `switch-examples` (gráficos con SDL2 + un framebuffer de libnx).
 - [ ] Configurar `nxlink` y verificar logs (`printf` → terminal del Mac).
 - [x] Crear una plantilla CMake mínima con `-DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake`, `nx_generate_nacp`, `nx_create_nro`. *(`switch/hello/`; compila sin warnings en la imagen `devkitpro/devkita64` (GCC 15.2) → `pes6_hello.nro` de 207 KB)*
-- [ ] Workflow de GitHub Actions que construya el `.nro` y lo suba como artifact. *(escrito en `.github/workflows/ci.yml` (job `switch-hello`, más job `framework` en macOS/Linux); falta que corra en verde)*
+- [x] Workflow de GitHub Actions que construya el `.nro` y lo suba como artifact. *(`.github/workflows/ci.yml`: job `switch-hello` + job `framework` en macOS/Linux; en verde desde `a359cb2`)*
 
 **DoD:** un `.nro` propio pinta un patrón en pantalla, lee los Joy-Con y manda logs por nxlink; CI en verde.
 
 ### Fase 2 — Framework PSPRecomp en escritorio  *(2–5 días)*
-- [ ] Fork de PSPRecomp; compilar solo el framework en macOS: `cmake -S . -B out/framework -DPSPRECOMP_PROFILE=""` y correr `ctest`. *(compila y `ctest` pasa en macOS sin cambios — solo warnings `-Wsign-conversion`; falta crear el fork en GitHub)*
+- [x] Fork de PSPRecomp; compilar solo el framework en macOS: `cmake -S . -B out/framework -DPSPRECOMP_PROFILE=""` y correr `ctest`. *(compila y `ctest` pasa en macOS y Linux sin cambios. Extra: el framework completo también compila y enlaza para Switch con devkitA64 sin cambios)*
 - [ ] Arreglar lo que dependa de MSVC/Windows en el framework (no en `vcs`), manteniendo los cambios genéricos y aislados (candidatos a PR upstream).
 - [ ] Leer `docs/PROFILE_GUIDE.md`, `docs/SOURCE_PROVENANCE.md` y recorrer `profiles/vcs/host` para entender: bootstrap, `Runtime::register_hle()`, `register_function()`, `register_native_fast_path()`, backend GE por software.
 - [ ] Documentar en `progress/` un mapa de cómo fluye un frame en el perfil VCS (display list GE → rasterizador CPU → presentación).
