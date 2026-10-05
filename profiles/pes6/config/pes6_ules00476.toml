@@ -1,0 +1,34 @@
+# PES6 (PSP) executable identity. Only metadata about the user's own dump:
+# no game code or data lives in this repository.
+
+[title]
+name = "Pro Evolution Soccer 6"
+disc_id = "ULES-00476"
+region = "Europe"
+disc_version = "1.03"
+psp_system_ver = "2.81"
+
+[iso]
+size_bytes = 1248329728
+sha1 = "e5adf0b1a8386a5a33a358c39e7aa76d6a7c54b6"
+
+[executable]
+# PSP_GAME/SYSDIR/EBOOT.BIN decrypted by PPSSPP 1.20.4
+# ("Dump Decrypted EBOOT.BIN When Booting Game").
+source = "PSP_GAME/SYSDIR/EBOOT.BIN"
+decrypted_size_bytes = 1915264
+decrypted_sha256 = "361b85a6c5576fa9ada7d57b0c9b5cccb62a4c999e33ccadaccfe30726385dd7"
+elf_type = "ET_EXEC"
+module = "we10psp"
+module_version = "1.1"
+load_base = 0x08804000
+entry = 0x089943DC
+gp = 0x089DE060
+relocations = 0
+
+[analysis]
+# psp_analyze @ upstream f6e7d41
+imports = 229
+import_libraries = 28
+automatic_functions = 5738
+indirect_call_sites = 435

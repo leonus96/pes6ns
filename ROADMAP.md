@@ -43,13 +43,13 @@ Si la Ruta A se abre en algún momento, saltar directo a la Fase 5 adaptando su 
 
 ### Juego (copia propia)
 - [x] Dump propio de PES6 PSP (UMD o PSN). Anotar **serial, región y SHA-1** del ISO. *(**ULES-00476** — Pro Evolution Soccer 6, Europa, DISC_VERSION 1.03, PSP_SYSTEM_VER 2.81; ISO 1 248 329 728 bytes, SHA-1 `e5adf0b1a8386a5a33a358c39e7aa76d6a7c54b6`)*
-- [ ] Obtener el `EBOOT.BIN` **desencriptado** *(el del ISO está cifrado — cabecera `~PSP`, 1 915 264 bytes; `BOOT.BIN` está vacío/ceros)* (ELF/PRX). PSPRecomp deja la desencriptación fuera del framework. Opciones: la opción de PPSSPP para volcar el EBOOT desencriptado al arrancar el juego, o `allegrexrecomp decrypt` de sp00nznet con material de claves propio.
+- [x] Obtener el `EBOOT.BIN` **desencriptado** *(el del ISO está cifrado — cabecera `~PSP`; `BOOT.BIN` está vacío/ceros. Descifrado con PPSSPP 1.20.4 → `profiles/pes6/game/EBOOT_DECRYPTED.BIN`, ELF SHA-256 `361b85a6…5dd7`)* (ELF/PRX). PSPRecomp deja la desencriptación fuera del framework. Opciones: la opción de PPSSPP para volcar el EBOOT desencriptado al arrancar el juego, o `allegrexrecomp decrypt` de sp00nznet con material de claves propio.
 - [ ] Extraer el resto de `PSP_GAME/USRDIR` (assets) a una carpeta local ignorada por git.
 
 ### Entorno de desarrollo
 - [x] macOS (o Linux) con CMake ≥ 3.20, Ninja, clang con C++20. *(CMake 4.4.3, Ninja, Apple clang)*
 - [x] devkitPro instalado + paquetes vía `dkp-pacman`: `switch-dev`, `switch-sdl2`, `switch-mesa`, `switch-ffmpeg` (si se necesita decodificar ATRAC3), `switch-tools`. *(macOS arm64: `switch-dev` + `switch-portlibs`; devkitA64 GCC 16.1 local vs 15.2 en la imagen de CI)*
-- [ ] PPSSPP de escritorio (oráculo / comparación).
+- [x] PPSSPP de escritorio (oráculo / comparación). *(PPSSPPSDL 1.20.4 vía `brew install --cask ppsspp`)*
 - [x] Alternativa sin toolchain local: CI con la imagen Docker `devkitpro/devkita64`. *(CI en verde; también se puede compilar local con `docker run devkitpro/devkita64`)*
 
 ---
@@ -106,12 +106,12 @@ Cada fase tiene **tareas**, **criterio de terminado (DoD)** y **estimación** pa
 **DoD:** framework compila y pasa tests en macOS; existe una nota que explica la arquitectura del perfil VCS.
 
 ### Fase 3 — Análisis de PES6  *(3–7 días)*
-- [ ] `psp_analyze` sobre el EBOOT desencriptado; guardar salida en `analysis/`.
+- [x] `psp_analyze` sobre el EBOOT desencriptado; guardar salida en `analysis/`. *(ELF estático `we10psp`, entry `0x089943DC`, 229 imports, 5 738 funciones)*
 - [ ] Contrastar con `allegrexrecomp info/funcs/cover` (sp00nznet) para cobertura de funciones y decodificación.
-- [ ] Listar **todos los imports (NIDs)** que usa PES6 por módulo (`sceGe`, `sceGu`/display, `sceCtrl`, `sceAudio`, `sceSas`, `sceAtrac3plus`, `sceMpeg`/`scePsmf`, `sceIo`, `sceUtility` savedata/OSK, `sceKernel` threads/semáforos/eventflags, `sceNet`/adhoc…).
-- [ ] Tabla de brechas: NID → ¿implementado en PSPRecomp? → prioridad (bloqueante para arrancar / para menú / para partido / opcional).
-- [ ] Detectar si el juego carga PRX adicionales (módulos en `USRDIR`) que también haya que recompilar.
-- [ ] Identificar uso de VFPU (PES probablemente lo usa en física/animación) e instrucciones aún no soportadas.
+- [x] Listar **todos los imports (NIDs)** que usa PES6 por módulo (`sceGe`, `sceGu`/display, `sceCtrl`, `sceAudio`, `sceSas`, `sceAtrac3plus`, `sceMpeg`/`scePsmf`, `sceIo`, `sceUtility` savedata/OSK, `sceKernel` threads/semáforos/eventflags, `sceNet`/adhoc…).
+- [x] Tabla de brechas: NID → ¿implementado en PSPRecomp? → prioridad (bloqueante para arrancar / para menú / para partido / opcional). *(`progress/brechas.md`: 146/229 ya existen en el perfil VCS, faltan 83)*
+- [x] Detectar si el juego carga PRX adicionales (módulos en `USRDIR`) que también haya que recompilar. *(solo módulos de Sony → HLE; nada que recompilar)*
+- [ ] Identificar uso de VFPU (PES probablemente lo usa en física/animación) e instrucciones aún no soportadas. *(~4.9k instr. VFPU; las 34 000 "no soportadas" del analizador son sobre todo datos leídos como código; quedan unas decenas candidatas por clasificar)*
 
 **DoD:** `profiles/pes6/config/` con el mapa de funciones inicial y un documento `progress/brechas.md` con la lista priorizada de HLE faltante.
 
