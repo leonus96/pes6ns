@@ -36,4 +36,5 @@ nxlink -s out/switch-hello/pes6_hello.nro   # envía a la consola y queda escuch
 ## Notas del entorno
 
 - El toolchain de Switch (`Switch.cmake`) define `NINTENDO_SWITCH`, `__SWITCH__` y enlaza `-lnx -lm` automáticamente. No hay `libdl` en Switch: no enlazar `${CMAKE_DL_LIBS}` bajo `NINTENDO_SWITCH`.
+- devkitPro instalado en el Mac (`/opt/devkitpro`, devkitA64 GCC 16.1). La imagen de CI `devkitpro/devkita64` trae GCC 15.2: si algo compila local y falla en CI, sospechar de la versión.
 - El framework compila en macOS/clang sin cambios (solo warnings `-Wsign-conversion` en `include/psprecomp/common.hpp`).

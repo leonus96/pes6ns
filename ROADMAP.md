@@ -48,7 +48,7 @@ Si la Ruta A se abre en algún momento, saltar directo a la Fase 5 adaptando su 
 
 ### Entorno de desarrollo
 - [x] macOS (o Linux) con CMake ≥ 3.20, Ninja, clang con C++20. *(CMake 4.4.3, Ninja, Apple clang)*
-- [ ] devkitPro instalado + paquetes vía `dkp-pacman`: `switch-dev`, `switch-sdl2`, `switch-mesa`, `switch-ffmpeg` (si se necesita decodificar ATRAC3), `switch-tools`.
+- [x] devkitPro instalado + paquetes vía `dkp-pacman`: `switch-dev`, `switch-sdl2`, `switch-mesa`, `switch-ffmpeg` (si se necesita decodificar ATRAC3), `switch-tools`. *(macOS arm64: `switch-dev` + `switch-portlibs`; devkitA64 GCC 16.1 local vs 15.2 en la imagen de CI)*
 - [ ] PPSSPP de escritorio (oráculo / comparación).
 - [x] Alternativa sin toolchain local: CI con la imagen Docker `devkitpro/devkita64`. *(CI en verde; también se puede compilar local con `docker run devkitpro/devkita64`)*
 
