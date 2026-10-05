@@ -22,6 +22,7 @@ std::uint64_t g_runtime_thread_switch_generation_fast = 0u;
 namespace {
 using RuntimePostImportHook = void (*)(Runtime &, AllegrexContext &);
 RuntimePostImportHook g_post_import_hook = nullptr;
+RuntimeImportObserver g_import_observer = nullptr;
 std::int32_t g_runtime_thread_uid = -1;
 std::array<char, 64> g_runtime_thread_name{};
 std::uint32_t g_runtime_dispatch_pc = 0u;
@@ -110,6 +111,7 @@ void set_runtime_post_chained_call_hook(RuntimePostChainedCallHook hook) noexcep
 }
 
 void set_runtime_post_import_hook(RuntimePostImportHook hook) noexcept { g_post_import_hook = hook; }
+void set_runtime_import_observer(RuntimeImportObserver observer) noexcept { g_import_observer = observer; }
 void set_runtime_thread_identity(std::int32_t uid, const std::string &name) noexcept {
     if (uid != g_runtime_thread_uid) ++g_runtime_thread_switch_generation_fast;
     g_runtime_thread_uid = uid;
@@ -1214,7 +1216,14 @@ void Runtime::invoke_import_cached(std::uint32_t slot, std::string_view library,
         import_bindings_[slot] = bound;
     }
 
-    (*bound)(*this, ctx);
+    if (g_import_observer != nullptr) {
+        const std::int32_t uid = g_runtime_thread_uid;
+        const std::uint32_t a0 = ctx.gpr[4], a1 = ctx.gpr[5];
+        (*bound)(*this, ctx);
+        g_import_observer(*this, library, nid, uid, a0, a1, ctx.gpr[2]);
+    } else {
+        (*bound)(*this, ctx);
+    }
     if (!stopped_ && g_post_import_hook != nullptr) g_post_import_hook(*this, ctx);
 }
 

@@ -3071,7 +3071,8 @@ void refresh_post_dispatch_hook() {
     const bool frozen_clock_guard_needed =
         execution_clock_dispatch_interval == 0u && frozen_clock_guard_limit != 0u;
     psprecomp::set_runtime_post_dispatch_hook(
-        frozen_clock_guard_needed || pc_profile_enabled() ? &pes6_post_dispatch_hook : nullptr);
+        frozen_clock_guard_needed || pc_profile_enabled() || std::getenv("PES6_TRACE_START_VBLANK") != nullptr
+            ? &pes6_post_dispatch_hook : nullptr);
 }
 
 // Frozen-clock safety guard. Only installed when the execution-driven PSP
@@ -3079,7 +3080,16 @@ void refresh_post_dispatch_hook() {
 // then keep delayed workers from ever reaching their deadlines.
 void pes6_post_dispatch_hook(psprecomp::Runtime &rt, psprecomp::AllegrexContext &,
                              std::uint32_t dispatch_pc, std::int32_t dispatch_thread_uid) {
-    if (pc_profile_enabled())
+    // PES6_TRACE_START_VBLANK/END_VBLANK: print every outer dispatch of the
+    // main thread (uid 1) in that window. Combine with PSPRECOMP_NO_CHAIN=1 to
+    // see each guest function entry.
+    static const std::uint64_t trace_start = parse_environment_u64("PES6_TRACE_START_VBLANK", 0u);
+    static const std::uint64_t trace_end = parse_environment_u64("PES6_TRACE_END_VBLANK", 0u);
+    if (trace_start != 0u && display_vblank_index >= trace_start && display_vblank_index <= trace_end &&
+        dispatch_thread_uid == 1)
+        std::cerr << "[trace] v=" << display_vblank_index << " pc=" << psprecomp::hex32(dispatch_pc) << "\n";
+    static const std::uint64_t pc_profile_start = parse_environment_u64("PES6_PC_PROFILE_START_VBLANK", 0u);
+    if (pc_profile_enabled() && display_vblank_index >= pc_profile_start)
         ++pc_profile_counts[(static_cast<std::uint64_t>(static_cast<std::uint32_t>(dispatch_thread_uid)) << 32u) |
                             dispatch_pc];
     if (execution_clock_dispatch_interval == 0u && frozen_clock_guard_limit != 0u) {
@@ -4560,7 +4570,42 @@ void put_name32(std::vector<std::uint8_t> &bytes, std::size_t offset, const std:
     for (std::size_t i = 0; i < 31u && i < name.size(); ++i) bytes[offset + i] = static_cast<std::uint8_t>(name[i]);
 }
 
+// PES6_FLIGHT_RECORDER=N: keep the last N HLE calls of every thread and print
+// them with the thread report, to see what each thread was doing at a stall.
+struct FlightEntry { std::string library; std::uint32_t nid{}; std::uint32_t a0{}, a1{}, result{}; std::uint64_t vblank{}; };
+std::map<std::int32_t, std::deque<FlightEntry>> flight_recorder;
+std::size_t flight_recorder_depth{};
+
+// PES6_TRACE_SEMA=0x30B,0x30C: log every ThreadMan call whose first argument is
+// one of those uids (wait/signal/refer/poll on semaphores or event flags).
+std::unordered_set<std::uint32_t> traced_kernel_objects;
+
+void flight_recorder_observer(psprecomp::Runtime &, std::string_view library, std::uint32_t nid,
+                              std::int32_t thread_uid, std::uint32_t a0, std::uint32_t a1, std::uint32_t result) {
+    if (!traced_kernel_objects.empty() && library == "ThreadManForUser" && traced_kernel_objects.contains(a0))
+        std::cerr << "[sema-trace] v=" << display_vblank_index << " uid=" << thread_uid << " nid="
+                  << psprecomp::hex32(nid) << " obj=" << psprecomp::hex32(a0) << " a1=" << psprecomp::hex32(a1)
+                  << " -> " << psprecomp::hex32(result) << "\n";
+    if (flight_recorder_depth == 0u) return;
+    auto &entries = flight_recorder[thread_uid];
+    if (entries.size() >= flight_recorder_depth) entries.pop_front();
+    entries.push_back(FlightEntry{std::string(library), nid, a0, a1, result, display_vblank_index});
+}
+
 void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
+    flight_recorder.clear();
+    flight_recorder_depth = static_cast<std::size_t>(parse_environment_u64("PES6_FLIGHT_RECORDER", 0u));
+    traced_kernel_objects.clear();
+    if (const char *list = std::getenv("PES6_TRACE_SEMA"); list != nullptr) {
+        for (const char *cursor = list; *cursor != '\0';) {
+            char *end = nullptr;
+            traced_kernel_objects.insert(static_cast<std::uint32_t>(std::strtoul(cursor, &end, 0)));
+            cursor = (*end == ',') ? end + 1 : end;
+            if (end == cursor && *end != '\0') break;
+        }
+    }
+    if (flight_recorder_depth != 0u || !traced_kernel_objects.empty())
+        psprecomp::set_runtime_import_observer(&flight_recorder_observer);
     install_auto_dialogs(runtime);
     open_disc_image(runtime.game_root());
     alarms.clear();
@@ -4805,9 +4850,18 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
         io_async_results.erase(found);
         set_success(ctx);
     };
-    runtime.register_hle("IoFileMgrForUser", 0xE23EEC33u, wait_async);   // sceIoWaitAsync
-    runtime.register_hle("IoFileMgrForUser", 0x35DBD746u, wait_async);   // sceIoWaitAsyncCB
-    runtime.register_hle("IoFileMgrForUser", 0x3251EA56u, wait_async);   // sceIoPollAsync: always complete
+    const auto logged = [wait_async](const char *name) {
+        return [wait_async, name](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
+            wait_async(rt, ctx);
+            if (runtime_log_enabled())
+                runtime_log_line(std::string("[io] ") + name + " fd=" + std::to_string(fd) + " -> " + psprecomp::hex32(ctx.gpr[2]) +
+                                 " v=" + std::to_string(display_vblank_index));
+        };
+    };
+    runtime.register_hle("IoFileMgrForUser", 0xE23EEC33u, logged("waitAsync"));   // sceIoWaitAsync
+    runtime.register_hle("IoFileMgrForUser", 0x35DBD746u, logged("waitAsyncCB")); // sceIoWaitAsyncCB
+    runtime.register_hle("IoFileMgrForUser", 0x3251EA56u, logged("pollAsync"));   // sceIoPollAsync: always complete
 
     runtime.register_hle("ThreadManForUser", 0x6652B8CAu, // sceKernelSetAlarm
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
@@ -9065,6 +9119,12 @@ void report_thread_state() {
         for (const auto &[key, count] : top)
             std::cout << "[pc-profile] uid=" << static_cast<std::int32_t>(key >> 32u)
                       << " pc=" << psprecomp::hex32(static_cast<std::uint32_t>(key)) << " dispatches=" << count << "\n";
+    }
+    for (const auto &[uid, entries] : flight_recorder) {
+        for (const FlightEntry &entry : entries)
+            std::cout << "[flight] uid=" << uid << " v=" << entry.vblank << " " << entry.library << ":"
+                      << psprecomp::hex32(entry.nid) << " a0=" << psprecomp::hex32(entry.a0)
+                      << " a1=" << psprecomp::hex32(entry.a1) << " -> " << psprecomp::hex32(entry.result) << "\n";
     }
     for (const auto &[uid, alarm] : alarms)
         std::cout << "[threads] alarm uid=" << uid << " due=" << alarm.due_us << " handler=" << psprecomp::hex32(alarm.handler) << "\n";

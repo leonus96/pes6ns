@@ -396,6 +396,14 @@ using RuntimePostDispatchHook = void (*)(Runtime &, AllegrexContext &, std::uint
                                          std::int32_t dispatch_thread_uid);
 void set_runtime_post_dispatch_hook(RuntimePostDispatchHook hook) noexcept;
 
+// Diagnostics: observes every HLE import after it returns. `thread_uid` and the
+// arguments are captured at call time; `result` is $v0 afterwards (the context
+// of whichever thread is current if the call switched threads).
+using RuntimeImportObserver = void (*)(Runtime &, std::string_view library, std::uint32_t nid,
+                                       std::int32_t thread_uid, std::uint32_t a0, std::uint32_t a1,
+                                       std::uint32_t result);
+void set_runtime_import_observer(RuntimeImportObserver observer) noexcept;
+
 // Optional diagnostics around native cross-unit calls.  Unlike the outer
 // dispatch hooks these fire for calls performed through invoke_chained_call(),
 // so a host profile can inspect a nested guest routine without disabling the
