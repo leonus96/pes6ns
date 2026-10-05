@@ -121,9 +121,10 @@ int main(int argc, char **argv) {
 
         std::cout << "Runtime stopped: " << runtime.stop_reason() << "\n";
         psprecomp::report_counted_pcs();
-        runtime.report_hle_histogram();
+        runtime.report_hle_histogram(250u);
         pes6::report_disc_read_stats();
         pes6::report_present_stats();
+        pes6::report_thread_state();
         pes6::audio_output_shutdown();
         pes6::display_window_shutdown();
         return runtime.stop_reason().empty() ? 0 : 4;

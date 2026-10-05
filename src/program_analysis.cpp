@@ -12,7 +12,32 @@
 namespace psprecomp {
 namespace {
 
+constexpr std::uint32_t kShtProgbits = 1u;
+constexpr std::uint32_t kShfAlloc = 0x2u;
+constexpr std::uint32_t kShfExecInstr = 0x4u;
+
+// Section headers describe code more precisely than program headers. Some
+// titles ship a single RWX PT_LOAD that holds .text, .rodata and .data
+// together; trusting the segment flags would decode data as instructions and
+// skip the jump tables stored in .data.
+std::vector<ExecutableRange> allocated_section_ranges(const Elf32Image &elf, std::uint32_t load_base,
+                                                      bool executable) {
+    std::vector<ExecutableRange> ranges;
+    for (const auto &section : elf.sections()) {
+        if (section.type != kShtProgbits || (section.flags & kShfAlloc) == 0u || section.size == 0u) continue;
+        if (((section.flags & kShfExecInstr) != 0u) != executable) continue;
+        const std::uint32_t start = elf.section_runtime_address(section, load_base);
+        const std::uint64_t end64 = static_cast<std::uint64_t>(start) + section.size;
+        if (end64 > std::numeric_limits<std::uint32_t>::max()) continue;
+        ranges.push_back({start, static_cast<std::uint32_t>(end64)});
+    }
+    std::sort(ranges.begin(), ranges.end(), [](const auto &a, const auto &b) { return a.start < b.start; });
+    return ranges;
+}
+
 std::vector<ExecutableRange> executable_ranges_for(const Elf32Image &elf, std::uint32_t load_base) {
+    if (auto from_sections = allocated_section_ranges(elf, load_base, true); !from_sections.empty())
+        return from_sections;
     std::vector<ExecutableRange> ranges;
     for (std::size_t i = 0; i < elf.segments().size(); ++i) {
         const auto &segment = elf.segments()[i];
@@ -275,6 +300,15 @@ void collect_relocated_data_code_pointers(const Elf32Image &elf,
                                           std::uint32_t load_base,
                                           const std::vector<ExecutableRange> &ranges,
                                           std::map<std::uint32_t, std::string> &seeds) {
+    // With section headers, scan exactly the allocated data sections (jump
+    // tables, vtables, callback arrays), even inside an RWX segment.
+    if (!allocated_section_ranges(elf, load_base, true).empty()) {
+        for (const auto &data : allocated_section_ranges(elf, load_base, false)) {
+            for (std::uint32_t address = (data.start + 3u) & ~3u; address + 4u <= data.end; address += 4u)
+                add_seed(seeds, ranges, memory.load32(address), "data_section_code_pointer");
+        }
+        return;
+    }
     for (std::size_t i = 0; i < elf.segments().size(); ++i) {
         const auto &segment = elf.segments()[i];
         if (segment.type != 1u || (segment.flags & 1u) != 0u || segment.file_size < 4u) continue;
@@ -299,6 +333,20 @@ std::map<std::uint32_t, std::string> collect_initial_seeds(const Elf32Image &elf
             const auto decoded = decode_allegrex(memory.load32(pc));
             if (decoded.kind != OpcodeKind::Jal) continue;
             add_seed(seeds, ranges, direct_jump_target(pc, decoded), "direct_jal_target");
+        }
+    }
+    // Functions reached only from code loaded at runtime (overlays) have no
+    // caller in the image. Seed every instruction that directly follows an
+    // unconditional `jr $ra` or `j` + delay slot: that is where the next
+    // function starts, whether it opens a stack frame or is a tail-call thunk.
+    // A seed that lands mid-function only adds a harmless dispatcher entry.
+    for (const auto &range : ranges) {
+        for (std::uint32_t pc = range.start + 8u; pc + 4u <= range.end; pc += 4u) {
+            const std::uint32_t previous = memory.load32(pc - 8u);
+            const bool returns = previous == 0x03E00008u;            // jr $ra
+            const bool jumps = (previous >> 26u) == 0x02u;           // j target
+            if ((returns || jumps) && memory.load32(pc) != 0u)        // skip nop padding
+                add_seed(seeds, ranges, pc, "after_unconditional_jump");
         }
     }
     collect_materialized_code_pointers(memory, ranges, seeds);

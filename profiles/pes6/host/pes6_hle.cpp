@@ -6,6 +6,7 @@
 // camera/vehicle side channels, Project2DFX and the profile self-tests.
 // See profiles/pes6/progress/poda_hle.md for the full list.
 #include "pes6_hle.hpp"
+#include "pes6_runtime_log.hpp"
 #include "audio_output.hpp"
 #include "display_window.hpp"
 #include "framebuffer_capture.hpp"
@@ -33,6 +34,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <deque>
 #include <atomic>
 #include <sstream>
@@ -490,7 +492,112 @@ bool disc_read_diag_enabled() {
     return enabled;
 }
 
+// When the user's ISO sits in the game root, raw UMD sector requests
+// (disc0:/sce_lbn...) are served from the image itself, byte for byte. Without
+// it, only the synthetic sectors of files registered below are available.
+struct DiscImage {
+    std::ifstream input;
+    std::uint64_t size{};
+    std::filesystem::path path;
+};
+DiscImage disc_image;
+
+void open_disc_image(const std::filesystem::path &game_root) {
+    disc_image = DiscImage{};
+    std::filesystem::path candidate;
+    if (const char *configured = std::getenv("PES6_ISO"); configured != nullptr && *configured != '\0') {
+        candidate = configured;
+    } else {
+        std::error_code ec;
+        for (const auto &entry : std::filesystem::directory_iterator(game_root, ec)) {
+            std::string extension = entry.path().extension().string();
+            std::transform(extension.begin(), extension.end(), extension.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (entry.is_regular_file() && extension == ".iso") { candidate = entry.path(); break; }
+        }
+    }
+    if (candidate.empty()) return;
+    disc_image.input.open(candidate, std::ios::binary);
+    if (!disc_image.input) { disc_image = DiscImage{}; return; }
+    disc_image.input.seekg(0, std::ios::end);
+    disc_image.size = static_cast<std::uint64_t>(disc_image.input.tellg());
+    disc_image.path = candidate;
+    std::cerr << "[umd] disc image " << candidate.string() << " (" << disc_image.size / 2048u << " sectors)\n";
+}
+
+std::size_t read_disc_image(VirtualDiscHandle &handle, std::span<std::uint8_t> output) {
+    if (handle.position >= handle.length || output.empty()) return 0u;
+    const std::size_t requested = static_cast<std::size_t>(
+        std::min<std::uint64_t>(handle.length - handle.position, output.size()));
+    disc_image.input.clear();
+    disc_image.input.seekg(static_cast<std::streamoff>(handle.base_offset + handle.position));
+    disc_image.input.read(reinterpret_cast<char *>(output.data()), static_cast<std::streamsize>(requested));
+    const auto read = static_cast<std::size_t>(disc_image.input.gcount());
+    handle.position += read;
+    return read;
+}
+
+// ISO 9660 lookup of a disc path's first sector. sceIoGetstat reports it in
+// st_private[0]; PES6 adds archive offsets to it and then reads the result
+// through disc0:/sce_lbn... paths.
+std::optional<std::uint32_t> disc_image_file_lbn(std::string path) {
+    if (!disc_image.input.is_open()) return std::nullopt;
+    if (const auto colon = path.find(':'); colon != std::string::npos) path.erase(0, colon + 1u);
+    const auto read_sector = [](std::uint32_t lbn, std::vector<std::uint8_t> &out, std::uint32_t bytes) {
+        out.assign(bytes, 0u);
+        disc_image.input.clear();
+        disc_image.input.seekg(static_cast<std::streamoff>(static_cast<std::uint64_t>(lbn) * 2048u));
+        disc_image.input.read(reinterpret_cast<char *>(out.data()), static_cast<std::streamsize>(bytes));
+        return disc_image.input.gcount() == static_cast<std::streamsize>(bytes);
+    };
+    const auto le32 = [](const std::uint8_t *p) {
+        return static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8u) |
+               (static_cast<std::uint32_t>(p[2]) << 16u) | (static_cast<std::uint32_t>(p[3]) << 24u);
+    };
+    std::vector<std::uint8_t> sector;
+    if (!read_sector(16u, sector, 2048u) || std::memcmp(sector.data() + 1u, "CD001", 5u) != 0) return std::nullopt;
+    std::uint32_t extent = le32(sector.data() + 156u + 2u);
+    std::uint32_t length = le32(sector.data() + 156u + 10u);
+
+    const auto upper = [](std::string text) {
+        for (auto &c : text) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        return text;
+    };
+    std::vector<std::string> parts;
+    for (std::size_t start = 0; start <= path.size();) {
+        const auto slash = path.find_first_of("/\\", start);
+        const std::string part = path.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+        if (!part.empty() && part != ".") parts.push_back(upper(part));
+        if (slash == std::string::npos) break;
+        start = slash + 1u;
+    }
+    if (parts.empty()) return extent;
+    for (const auto &part : parts) {
+        std::vector<std::uint8_t> directory;
+        if (length == 0u || length > 64u * 1024u * 1024u || !read_sector(extent, directory, length)) return std::nullopt;
+        bool found = false;
+        for (std::uint32_t offset = 0; offset < length;) {
+            const std::uint8_t record = directory[offset];
+            if (record == 0u) { offset = (offset / 2048u + 1u) * 2048u; continue; }
+            if (offset + record > length || record < 34u) break;
+            const std::uint8_t name_length = directory[offset + 32u];
+            std::string name(reinterpret_cast<const char *>(directory.data() + offset + 33u), name_length);
+            if (const auto version = name.find(';'); version != std::string::npos) name.erase(version);
+            if (upper(name) == part) {
+                extent = le32(directory.data() + offset + 2u);
+                length = le32(directory.data() + offset + 10u);
+                found = true;
+                break;
+            }
+            offset += record;
+        }
+        if (!found) return std::nullopt;
+    }
+    return extent;
+}
+
 std::size_t read_virtual_disc(VirtualDiscHandle &handle, std::span<std::uint8_t> output) {
+    if (disc_image.input.is_open()) return read_disc_image(handle, output);
     if (handle.position >= handle.length || output.empty()) return 0u;
     const std::uint64_t available = handle.length - handle.position;
     const std::size_t requested = static_cast<std::size_t>(
@@ -1126,6 +1233,7 @@ enum class AsyncReturnKind : std::uint8_t {
     SubInterrupt,
     MpegRingbuffer,
     UserCallback,
+    Alarm,
 };
 
 struct AsyncReturnFrame {
@@ -2906,26 +3014,73 @@ void queue_guest_callback_chain(psprecomp::AllegrexContext &ctx,
     }
 }
 
+// sceKernelSetAlarm: one-shot handlers that run in interrupt context once
+// virtual time reaches their deadline. A handler returning non-zero re-arms
+// itself for that many microseconds.
+struct AlarmRecord {
+    std::uint64_t due_us{};
+    std::uint32_t handler{};
+    std::uint32_t common{};
+};
+std::int32_t next_alarm_uid{0x700};
+std::map<std::int32_t, AlarmRecord> alarms;
+
+bool maybe_start_due_alarm(psprecomp::AllegrexContext &ctx) {
+    if (alarms.empty()) return false;
+    const auto thread = thread_table.threads.find(thread_table.current_uid);
+    if (thread == thread_table.threads.end() || thread->second.state != ThreadState::Running) return false;
+    const auto frames = async_return_frames.find(thread_table.current_uid);
+    if (frames != async_return_frames.end() && !frames->second.empty()) return false;
+    auto due = alarms.end();
+    for (auto it = alarms.begin(); it != alarms.end(); ++it) {
+        if (it->second.due_us <= virtual_time_us && (due == alarms.end() || it->second.due_us < due->second.due_us))
+            due = it;
+    }
+    if (due == alarms.end()) return false;
+    AsyncReturnFrame frame{AsyncReturnKind::Alarm, ctx};
+    frame.callback_uid = due->first;
+    async_return_frames[thread_table.current_uid].push_back(frame);
+    ctx.set_gpr(4, due->second.common);
+    ctx.set_gpr(31, 0x00000004u);
+    ctx.pc = due->second.handler;
+    if (std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr)
+        std::cerr << "[alarm] fire uid=" << due->first << " handler=" << psprecomp::hex32(due->second.handler)
+                  << " t=" << virtual_time_us << "\n";
+    return true;
+}
+
 void pes6_post_import_hook(psprecomp::Runtime &runtime, psprecomp::AllegrexContext &ctx) {
     if (ge_async_running()) {
         ge_async_drain_completions();
         if (!ge_async_check_fatal(runtime)) return;
     }
+    if (maybe_start_due_alarm(ctx)) return;
     (void)maybe_start_pending_guest_callback(ctx);
 }
+
+// PES6_PC_PROFILE=1: counts outer dispatches per (thread, guest pc) so a boot
+// that spins without progress shows where each thread is looping.
+bool pc_profile_enabled() {
+    static const bool enabled = std::getenv("PES6_PC_PROFILE") != nullptr;
+    return enabled;
+}
+std::unordered_map<std::uint64_t, std::uint64_t> pc_profile_counts;
 
 void refresh_post_dispatch_hook() {
     const bool frozen_clock_guard_needed =
         execution_clock_dispatch_interval == 0u && frozen_clock_guard_limit != 0u;
     psprecomp::set_runtime_post_dispatch_hook(
-        frozen_clock_guard_needed ? &pes6_post_dispatch_hook : nullptr);
+        frozen_clock_guard_needed || pc_profile_enabled() ? &pes6_post_dispatch_hook : nullptr);
 }
 
 // Frozen-clock safety guard. Only installed when the execution-driven PSP
 // clock is disabled (PSPRECOMP_TIME_TICK_DISPATCHES=0): a polling thread could
 // then keep delayed workers from ever reaching their deadlines.
 void pes6_post_dispatch_hook(psprecomp::Runtime &rt, psprecomp::AllegrexContext &,
-                             std::uint32_t dispatch_pc, std::int32_t) {
+                             std::uint32_t dispatch_pc, std::int32_t dispatch_thread_uid) {
+    if (pc_profile_enabled())
+        ++pc_profile_counts[(static_cast<std::uint64_t>(static_cast<std::uint32_t>(dispatch_thread_uid)) << 32u) |
+                            dispatch_pc];
     if (execution_clock_dispatch_interval == 0u && frozen_clock_guard_limit != 0u) {
         const bool has_delayed_thread = std::any_of(
             thread_table.threads.begin(), thread_table.threads.end(), [](const auto &item) {
@@ -4062,6 +4217,18 @@ void pes6_interrupt_return(psprecomp::Runtime &runtime, psprecomp::AllegrexConte
         (void)maybe_start_pending_guest_callback(ctx);
         return;
     }
+    if (kind == AsyncReturnKind::Alarm) {
+        const std::int32_t alarm_uid = found->second.back().callback_uid;
+        const std::uint32_t rearm_us = ctx.gpr[2];
+        ctx = found->second.back().resume;
+        found->second.pop_back();
+        if (found->second.empty()) async_return_frames.erase(found);
+        if (const auto alarm = alarms.find(alarm_uid); alarm != alarms.end()) {
+            if (rearm_us == 0u) alarms.erase(alarm);
+            else alarm->second.due_us = virtual_time_us + rearm_us;
+        }
+        return;
+    }
     if (kind == AsyncReturnKind::UserCallback) {
         ctx = found->second.back().resume;
         found->second.pop_back();
@@ -4182,6 +4349,390 @@ bool event_flag_matches(const EventFlagRecord &flag, std::uint32_t requested, st
 void consume_event_flag(EventFlagRecord &flag, std::uint32_t requested, std::uint32_t mode) {
     if ((mode & 0x20u) != 0u) flag.current_pattern &= ~requested;
     if ((mode & 0x10u) != 0u) flag.current_pattern = 0u;
+}
+
+// ---------------------------------------------------------------------------
+// PES6 additions: imports PES6 (ULES-00476) uses that the VCS-derived HLE did
+// not implement. See profiles/pes6/progress/brechas.md for the gap table.
+// ---------------------------------------------------------------------------
+
+// Synchronous IoFileMgr handlers, kept so the *Async variants can reuse them.
+std::unordered_map<std::uint32_t, psprecomp::Runtime::HleFunction> io_sync_handlers;
+
+void register_io_sync(psprecomp::Runtime &runtime, std::uint32_t nid, psprecomp::Runtime::HleFunction function) {
+    if (nid == 0x109F50BCu) { // sceIoOpen: log every guest path and its result
+        function = [inner = std::move(function)](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const std::string path = rt.memory().read_c_string(ctx.gpr[4]);
+            const std::uint32_t flags = ctx.gpr[5];
+            inner(rt, ctx);
+            if (runtime_log_enabled())
+                runtime_log_line("[io] open \"" + path + "\" flags=" + psprecomp::hex32(flags) +
+                                 " -> " + psprecomp::hex32(ctx.gpr[2]));
+        };
+    }
+    io_sync_handlers[nid] = function;
+    runtime.register_hle("IoFileMgrForUser", nid, std::move(function));
+}
+
+// Host I/O completes immediately, so each async request runs its synchronous
+// counterpart at submission and parks the 64-bit result until the guest waits
+// or polls for it.
+std::unordered_map<std::int32_t, std::uint64_t> io_async_results;
+
+std::uint64_t run_io_sync(std::uint32_t nid, psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+    io_sync_handlers.at(nid)(rt, ctx);
+    return static_cast<std::uint64_t>(ctx.gpr[2]) | (static_cast<std::uint64_t>(ctx.gpr[3]) << 32u);
+}
+
+std::int64_t sign_extend_result(std::uint64_t value, bool wide) {
+    return wide ? static_cast<std::int64_t>(value) : static_cast<std::int32_t>(static_cast<std::uint32_t>(value));
+}
+
+std::int32_t umd_callback_uid{-1};
+bool umd_activated{};
+
+void notify_umd_callback() {
+    const auto found = callback_table.callbacks.find(umd_callback_uid);
+    if (found == callback_table.callbacks.end()) return;
+    ++found->second.notify_count;
+    found->second.notify_argument = 0x32u;
+}
+
+constexpr std::int32_t kMainModuleUid = 0x3FF;
+constexpr std::int32_t kStdinFd = 0;
+constexpr std::int32_t kStdoutFd = 1;
+constexpr std::int32_t kStderrFd = 2;
+
+std::uint32_t system_language() {
+    // PSP_SYSTEMPARAM_LANGUAGE: 0 ja, 1 en, 2 fr, 3 es, 4 de, 5 it, 6 nl, 7 pt.
+    if (const char *text = std::getenv("PES6_LANGUAGE"); text != nullptr && *text != '\0')
+        return static_cast<std::uint32_t>(std::strtoul(text, nullptr, 0));
+    return 3u;
+}
+
+// Copies `size` bytes of a guest-side info struct, honouring the caller's
+// leading size word so older/smaller SDK layouts are not overrun.
+void store_info_struct(psprecomp::GuestMemory &memory, std::uint32_t address,
+                       const std::vector<std::uint8_t> &bytes) {
+    if (address == 0u || !memory.contains(address, 4u)) return;
+    const std::uint32_t requested = memory.load32(address);
+    const std::size_t count = std::min<std::size_t>(requested, bytes.size());
+    if (count == 0u || !memory.contains(address, count)) return;
+    memory.copy_in(address, std::span<const std::uint8_t>(bytes.data(), count));
+}
+
+void put_le32(std::vector<std::uint8_t> &bytes, std::size_t offset, std::uint32_t value) {
+    for (std::size_t i = 0; i < 4u; ++i) bytes[offset + i] = static_cast<std::uint8_t>(value >> (8u * i));
+}
+
+void put_name32(std::vector<std::uint8_t> &bytes, std::size_t offset, const std::string &name) {
+    for (std::size_t i = 0; i < 31u && i < name.size(); ++i) bytes[offset + i] = static_cast<std::uint8_t>(name[i]);
+}
+
+void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
+    open_disc_image(runtime.game_root());
+    alarms.clear();
+    io_async_results.clear();
+    umd_callback_uid = -1;
+    umd_activated = false;
+    // --- ModuleMgrForUser -------------------------------------------------
+    runtime.register_hle("ModuleMgrForUser", 0xD8B73127u, // sceKernelGetModuleIdByAddress
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            ctx.set_gpr(2, static_cast<std::uint32_t>(kMainModuleUid));
+        });
+    runtime.register_hle("ModuleMgrForUser", 0xF0A26395u, // sceKernelGetModuleId
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            ctx.set_gpr(2, static_cast<std::uint32_t>(kMainModuleUid));
+        });
+    runtime.register_hle("ModuleMgrForUser", 0x8F2DF740u, // sceKernelStopUnloadSelfModuleWithStatus
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            rt.stop("guest unloaded its own module (status " + psprecomp::hex32(ctx.gpr[4]) + ")");
+        });
+    runtime.register_hle("LoadExecForUser", 0x05572A5Fu, // sceKernelExitGame
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &) { rt.stop("sceKernelExitGame"); });
+
+    // --- Kernel_Library: interrupts are never preempted in this host ------
+    runtime.register_hle("Kernel_Library", 0x092968F4u, // sceKernelCpuSuspendIntr
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { ctx.set_gpr(2, 1u); });
+    runtime.register_hle("Kernel_Library", 0x5F10D406u, // sceKernelCpuResumeIntr
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { set_success(ctx); });
+
+    // --- StdioForUser / console output -------------------------------------
+    runtime.register_hle("StdioForUser", 0x172D316Eu, // sceKernelStdin
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { ctx.set_gpr(2, kStdinFd); });
+    runtime.register_hle("StdioForUser", 0xA6BAB2E9u, // sceKernelStdout
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { ctx.set_gpr(2, kStdoutFd); });
+    runtime.register_hle("StdioForUser", 0xF78BA90Au, // sceKernelStderr
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { ctx.set_gpr(2, kStderrFd); });
+    runtime.register_hle("SysMemUserForUser", 0x13A5ABEFu, // sceKernelPrintf
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            // Format arguments are not expanded yet; the raw format is enough to
+            // follow the boot. O32 varargs formatting can be recovered from
+            // profiles/vcs/host/vcs_profile.cpp (O32VarArgs) when needed.
+            if (ctx.gpr[4] != 0u)
+                runtime_log_line("[guest-printf] " + rt.memory().read_c_string(ctx.gpr[4], 512u));
+            set_success(ctx);
+        });
+    runtime.register_hle("IoFileMgrForUser", 0x42EC03ACu, // sceIoWrite
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
+            const std::uint32_t source = ctx.gpr[5];
+            const std::uint32_t size = ctx.gpr[6];
+            if (size != 0u && !rt.memory().contains(source, size)) {
+                ctx.set_gpr(2, 0x80010016u); // EINVAL
+                return;
+            }
+            std::vector<std::uint8_t> bytes(size);
+            if (size != 0u) rt.memory().copy_out(source, bytes);
+            if (fd == kStdoutFd || fd == kStderrFd) {
+                runtime_log_line("[guest-stdout] " + std::string(bytes.begin(), bytes.end()));
+                ctx.set_gpr(2, size);
+                return;
+            }
+            const auto it = file_table.files.find(fd);
+            if (it == file_table.files.end()) {
+                ctx.set_gpr(2, 0x80020323u); // SCE_KERNEL_ERROR_BADF
+                return;
+            }
+            it->second.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(size));
+            it->second.flush();
+            ctx.set_gpr(2, it->second ? size : 0x80010005u); // EIO
+        });
+    runtime.register_hle("IoFileMgrForUser", 0x55F4717Du, // sceIoChdir
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            // translate_path() resolves every guest path from the game root, so a
+            // working directory is only recorded for diagnostics.
+            runtime_log_line("[io] sceIoChdir " + rt.memory().read_c_string(ctx.gpr[4], 256u));
+            set_success(ctx);
+        });
+
+    // --- UtilsForUser libc time --------------------------------------------
+    runtime.register_hle("UtilsForUser", 0x27CC57F0u, // sceKernelLibcTime
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            const auto value = static_cast<std::uint32_t>(now);
+            if (ctx.gpr[4] != 0u && rt.memory().contains(ctx.gpr[4], 4u)) rt.memory().store32(ctx.gpr[4], value);
+            ctx.set_gpr(2, value);
+        });
+    runtime.register_hle("UtilsForUser", 0x91E4F6A7u, // sceKernelLibcClock
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            ctx.set_gpr(2, static_cast<std::uint32_t>(virtual_time_us));
+        });
+    runtime.register_hle("UtilsForUser", 0x71EC4271u, // sceKernelLibcGettimeofday
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            const std::uint32_t tv = ctx.gpr[4];
+            if (tv != 0u && rt.memory().contains(tv, 8u)) {
+                rt.memory().store32(tv, static_cast<std::uint32_t>(now / 1000000));
+                rt.memory().store32(tv + 4u, static_cast<std::uint32_t>(now % 1000000));
+            }
+            const std::uint32_t tz = ctx.gpr[5];
+            if (tz != 0u && rt.memory().contains(tz, 8u)) {
+                rt.memory().store32(tz, 0u);
+                rt.memory().store32(tz + 4u, 0u);
+            }
+            set_success(ctx);
+        });
+
+    // --- sceDmac -------------------------------------------------------------
+    runtime.register_hle("sceDmac", 0x617F3FE6u, // sceDmacMemcpy
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const std::uint32_t destination = ctx.gpr[4];
+            const std::uint32_t source = ctx.gpr[5];
+            const std::uint32_t size = ctx.gpr[6];
+            if (size == 0u) { set_success(ctx); return; }
+            if (!rt.memory().contains(destination, size) || !rt.memory().contains(source, size)) {
+                ctx.set_gpr(2, 0x80000023u); // SCE_ERROR_INVALID_POINTER
+                return;
+            }
+            std::vector<std::uint8_t> bytes(size);
+            rt.memory().copy_out(source, bytes);
+            rt.memory().copy_in(destination, bytes);
+            set_success(ctx);
+        });
+
+    // --- sceUtility: module loading and system parameters --------------------
+    for (const std::uint32_t nid : {0x0D5BC6D2u /* LoadUsbModule */, 0x1579A159u /* LoadNetModule */,
+                                    0xC629AF26u /* LoadAvModule */}) {
+        runtime.register_hle("sceUtility", nid,
+            [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { set_success(ctx); });
+    }
+    runtime.register_hle("sceUtility", 0xA5DA2406u, // sceUtilityGetSystemParamInt
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            std::uint32_t value = 0u;
+            switch (ctx.gpr[4]) {
+            case 2u: value = 0u; break;                // adhoc channel: automatic
+            case 3u: value = 0u; break;                // WLAN power save: off
+            case 4u: value = 2u; break;                // date format: DD/MM/YYYY
+            case 5u: value = 0u; break;                // time format: 24h
+            case 6u: value = 60u; break;               // timezone offset (minutes)
+            case 7u: value = 0u; break;                // daylight saving: off
+            case 8u: value = system_language(); break; // language
+            case 9u: value = 1u; break;                // confirm button: cross
+            default:
+                ctx.set_gpr(2, 0x80110103u); // invalid system parameter id
+                return;
+            }
+            if (ctx.gpr[5] != 0u && rt.memory().contains(ctx.gpr[5], 4u)) rt.memory().store32(ctx.gpr[5], value);
+            set_success(ctx);
+        });
+    runtime.register_hle("sceUtility", 0x34B78343u, // sceUtilityGetSystemParamString
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            if (ctx.gpr[4] != 1u) { ctx.set_gpr(2, 0x80110103u); return; } // only the nickname
+            const std::string nickname = "PES6";
+            const std::uint32_t destination = ctx.gpr[5];
+            const std::uint32_t length = ctx.gpr[6];
+            if (length == 0u || !rt.memory().contains(destination, length)) { ctx.set_gpr(2, 0x80110103u); return; }
+            for (std::uint32_t i = 0; i < length; ++i)
+                rt.memory().store8(destination + i, i < nickname.size() ? static_cast<std::uint8_t>(nickname[i]) : 0u);
+            set_success(ctx);
+        });
+
+    // --- ThreadManForUser queries ---------------------------------------------
+    runtime.register_hle("ThreadManForUser", 0x94AA61EEu, // sceKernelGetThreadCurrentPriority
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            ctx.set_gpr(2, thread_priority(thread_table.current_uid));
+        });
+    runtime.register_hle("ThreadManForUser", 0xBC6FEBC5u, // sceKernelReferSemaStatus
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const auto found = semaphore_table.semaphores.find(static_cast<std::int32_t>(ctx.gpr[4]));
+            if (found == semaphore_table.semaphores.end()) { ctx.set_gpr(2, 0x80020199u); return; } // unknown sema
+            std::vector<std::uint8_t> info(56u, 0u);
+            put_le32(info, 0u, 56u);
+            put_name32(info, 4u, found->second.name);
+            put_le32(info, 40u, static_cast<std::uint32_t>(found->second.count));   // init count (not tracked)
+            put_le32(info, 44u, static_cast<std::uint32_t>(found->second.count));
+            put_le32(info, 48u, static_cast<std::uint32_t>(found->second.maximum));
+            put_le32(info, 52u, static_cast<std::uint32_t>(found->second.waiters.size()));
+            store_info_struct(rt.memory(), ctx.gpr[5], info);
+            set_success(ctx);
+        });
+    runtime.register_hle("ThreadManForUser", 0xA66B0120u, // sceKernelReferEventFlagStatus
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const auto found = event_flag_table.flags.find(static_cast<std::int32_t>(ctx.gpr[4]));
+            if (found == event_flag_table.flags.end()) { ctx.set_gpr(2, 0x8002019Au); return; } // unknown evf
+            std::vector<std::uint8_t> info(52u, 0u);
+            put_le32(info, 0u, 52u);
+            put_name32(info, 4u, found->second.name);
+            put_le32(info, 36u, found->second.attributes);
+            put_le32(info, 40u, found->second.initial_pattern);
+            put_le32(info, 44u, found->second.current_pattern);
+            put_le32(info, 48u, static_cast<std::uint32_t>(found->second.waiters.size()));
+            store_info_struct(rt.memory(), ctx.gpr[5], info);
+            set_success(ctx);
+        });
+
+    // --- IoFileMgrForUser async family ------------------------------------------
+    constexpr std::uint32_t kNoAsyncPending = 0x80020329u; // no async operation on this fd
+    runtime.register_hle("IoFileMgrForUser", 0x89AA9906u, // sceIoOpenAsync
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const std::uint64_t result = run_io_sync(0x109F50BCu, rt, ctx);
+            const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(result));
+            if (fd >= 0) io_async_results[fd] = static_cast<std::uint64_t>(fd);
+            ctx.set_gpr(2, static_cast<std::uint32_t>(fd));
+        });
+    runtime.register_hle("IoFileMgrForUser", 0xA0B5A7C2u, // sceIoReadAsync
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
+            const std::uint32_t destination = ctx.gpr[5];
+            const std::uint32_t size = ctx.gpr[6];
+            const std::uint64_t result = run_io_sync(0x6A638D83u, rt, ctx);
+            io_async_results[fd] = static_cast<std::uint64_t>(sign_extend_result(result, false));
+            if (runtime_log_enabled())
+                runtime_log_line("[io] readAsync fd=" + std::to_string(fd) + " dst=" + psprecomp::hex32(destination) +
+                                 " size=" + psprecomp::hex32(size) + " -> " + psprecomp::hex32(static_cast<std::uint32_t>(result)));
+            set_success(ctx);
+        });
+    runtime.register_hle("IoFileMgrForUser", 0x71B19E77u, // sceIoLseekAsync
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
+            io_async_results[fd] = run_io_sync(0x27EB27B8u, rt, ctx);
+            if (runtime_log_enabled())
+                runtime_log_line("[io] lseekAsync fd=" + std::to_string(fd) + " -> " +
+                                 std::to_string(static_cast<std::int64_t>(io_async_results[fd])));
+            set_success(ctx);
+        });
+    runtime.register_hle("IoFileMgrForUser", 0xFF5940B6u, // sceIoCloseAsync
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
+            const std::uint64_t result = run_io_sync(0x810C4BC3u, rt, ctx);
+            io_async_results[fd] = static_cast<std::uint64_t>(sign_extend_result(result, false));
+            set_success(ctx);
+        });
+    const auto wait_async = [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+        const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
+        const auto found = io_async_results.find(fd);
+        if (found == io_async_results.end()) { ctx.set_gpr(2, kNoAsyncPending); return; }
+        const std::uint32_t out = ctx.gpr[5];
+        if (out != 0u && rt.memory().contains(out, 8u)) {
+            rt.memory().store32(out, static_cast<std::uint32_t>(found->second));
+            rt.memory().store32(out + 4u, static_cast<std::uint32_t>(found->second >> 32u));
+        }
+        io_async_results.erase(found);
+        set_success(ctx);
+    };
+    runtime.register_hle("IoFileMgrForUser", 0xE23EEC33u, wait_async);   // sceIoWaitAsync
+    runtime.register_hle("IoFileMgrForUser", 0x35DBD746u, wait_async);   // sceIoWaitAsyncCB
+    runtime.register_hle("IoFileMgrForUser", 0x3251EA56u, wait_async);   // sceIoPollAsync: always complete
+
+    runtime.register_hle("ThreadManForUser", 0x6652B8CAu, // sceKernelSetAlarm
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            const std::int32_t uid = next_alarm_uid++;
+            alarms[uid] = AlarmRecord{virtual_time_us + ctx.gpr[4], ctx.gpr[5], ctx.gpr[6]};
+            ctx.set_gpr(2, static_cast<std::uint32_t>(uid));
+        });
+    runtime.register_hle("ThreadManForUser", 0x7E65B999u, // sceKernelCancelAlarm
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            const bool erased = alarms.erase(static_cast<std::int32_t>(ctx.gpr[4])) == 1u;
+            ctx.set_gpr(2, erased ? 0u : 0x800201A5u); // unknown alarm id
+        });
+
+    runtime.register_hle("sceDisplay", 0x773DD3A3u, // sceDisplayGetCurrentHcount
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            // 286 scanlines per 59.94 Hz frame (272 visible + blanking).
+            const std::uint64_t period = virtual_vblank_period_us();
+            ctx.set_gpr(2, static_cast<std::uint32_t>((virtual_time_us % period) * 286u / period));
+        });
+    runtime.register_hle("IoFileMgrForUser", 0x63632449u, // sceIoIoctl
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            // Logged so the commands PES6 really issues can be implemented
+            // from data; UMD ioctls on PSP_GAME files are mostly hints.
+            runtime_log_line("[io] sceIoIoctl fd=" + std::to_string(static_cast<std::int32_t>(ctx.gpr[4])) +
+                             " cmd=" + psprecomp::hex32(ctx.gpr[5]) + " in=" + psprecomp::hex32(ctx.gpr[6]) +
+                             " inlen=" + std::to_string(ctx.gpr[7]));
+            set_success(ctx);
+        });
+
+    // --- UMD callback notification -----------------------------------------------
+    // The VCS stubs accepted sceUmdRegisterUMDCallBack but never notified the
+    // callback; PES6 waits for that notification before loading anything.
+    // Drive state 0x32 = PRESENT | INITED | READY.
+    runtime.register_hle("sceUmdUser", 0xAEE7404Du, // sceUmdRegisterUMDCallBack
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            umd_callback_uid = static_cast<std::int32_t>(ctx.gpr[4]);
+            if (umd_activated) notify_umd_callback();
+            set_success(ctx);
+        });
+    runtime.register_hle("sceUmdUser", 0xBD2BDE07u, // sceUmdUnRegisterUMDCallBack
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            umd_callback_uid = -1;
+            set_success(ctx);
+        });
+    runtime.register_hle("sceUmdUser", 0xC6183D47u, // sceUmdActivate
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            umd_activated = true;
+            notify_umd_callback();
+            set_success(ctx);
+        });
+
+    // --- sceUmdUser stubs ------------------------------------------------------
+    for (const std::uint32_t nid : {0x4A9E5E29u /* WaitDriveStatCB */, 0x6AF9B50Au /* CancelWaitDriveStat */,
+                                    0xE83742BAu /* Deactivate */}) {
+        runtime.register_hle("sceUmdUser", nid,
+            [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { set_success(ctx); });
+    }
 }
 
 void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start) {
@@ -7952,9 +8503,17 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 rt.memory().store16(base + 8u, static_cast<std::uint16_t>(parts.tm_min));
                 rt.memory().store16(base + 10u, static_cast<std::uint16_t>(parts.tm_sec));
             }
+            // st_private[0]: first UMD sector of the file.
+            if (path.rfind("disc0:", 0u) == 0u || path.rfind("umd0:", 0u) == 0u) {
+                if (const auto lbn = disc_image_file_lbn(path)) {
+                    rt.memory().store32(stat_address + 0x40u, *lbn);
+                    if (runtime_log_enabled())
+                        runtime_log_line("[io] getstat \"" + path + "\" lbn=" + psprecomp::hex32(*lbn));
+                }
+            }
             set_success(ctx);
         });
-    runtime.register_hle("IoFileMgrForUser", 0x109F50BCu,
+    register_io_sync(runtime, 0x109F50BCu,
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
             const std::string path = rt.memory().read_c_string(ctx.gpr[4]);
             const auto native = rt.translate_path(path);
@@ -7983,6 +8542,17 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                         file_table.synthetic_empty_files.insert(fd);
                         ctx.set_gpr(2, static_cast<std::uint32_t>(fd));
                         return;
+                    }
+                    if (parsed && disc_image.input.is_open()) {
+                        const std::uint64_t base_offset = raw_lbn * 2048ull;
+                        if (base_offset < disc_image.size) {
+                            const auto fd = file_table.next_fd++;
+                            file_table.virtual_disc_handles.emplace(
+                                fd, VirtualDiscHandle{base_offset,
+                                                      std::min<std::uint64_t>(raw_size, disc_image.size - base_offset), 0u});
+                            ctx.set_gpr(2, static_cast<std::uint32_t>(fd));
+                            return;
+                        }
                     }
                     if (parsed) {
                         if (const auto *disc_file = find_virtual_disc_file(
@@ -8050,7 +8620,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             ctx.set_gpr(2, static_cast<std::uint32_t>(fd));
         });
 
-    runtime.register_hle("IoFileMgrForUser", 0x27EB27B8u,
+    register_io_sync(runtime, 0x27EB27B8u,
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
             const std::uint64_t raw_offset = static_cast<std::uint64_t>(ctx.gpr[6]) |
@@ -8158,7 +8728,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             ctx.set_gpr(2, static_cast<std::uint32_t>(position));
         });
 
-    runtime.register_hle("IoFileMgrForUser", 0x810C4BC3u,
+    register_io_sync(runtime, 0x810C4BC3u,
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
             const bool closed = file_table.files.erase(fd) == 1u ||
@@ -8169,7 +8739,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             ctx.set_gpr(2, closed ? 0u : 0x80010009u);
         });
 
-    runtime.register_hle("IoFileMgrForUser", 0x6A638D83u,
+    register_io_sync(runtime, 0x6A638D83u,
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
             const std::uint32_t dst = ctx.gpr[5];
@@ -8223,6 +8793,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             if (time_io) io_host_time_this_vblank += std::chrono::steady_clock::now() - io_entry;
             ctx.set_gpr(2, static_cast<std::uint32_t>(read));
         });
+    install_pes6_gap_hle(runtime);
 }
 
 
@@ -8294,6 +8865,50 @@ void report_present_stats() {
                   << " wait_calls=" << async_wait_calls
                   << " wait_us=" << async_wait_us << "\n";
     }
+}
+
+void report_thread_state() {
+    const auto state_name = [](ThreadState state) {
+        switch (state) {
+        case ThreadState::Created: return "created";
+        case ThreadState::Ready: return "ready";
+        case ThreadState::Running: return "running";
+        case ThreadState::Sleeping: return "sleeping";
+        case ThreadState::Delayed: return "delayed";
+        case ThreadState::Completed: return "completed";
+        }
+        return "?";
+    };
+    std::map<std::int32_t, std::string> waits;
+    for (const auto &[uid, sema] : semaphore_table.semaphores)
+        for (const auto &waiter : sema.waiters)
+            waits[waiter.uid] = "sema " + std::to_string(uid) + " \"" + sema.name + "\" count=" +
+                                std::to_string(sema.count) + " want=" + std::to_string(waiter.requested);
+    for (const auto &[uid, flag] : event_flag_table.flags)
+        for (const auto &waiter : flag.waiters)
+            waits[waiter.uid] = "evf " + std::to_string(uid) + " \"" + flag.name + "\" pattern=" +
+                                psprecomp::hex32(flag.current_pattern) + " want=" + psprecomp::hex32(waiter.requested) +
+                                " mode=" + psprecomp::hex32(waiter.mode);
+    std::cout << "[threads] t=" << virtual_time_us << "us current=" << thread_table.current_uid << "\n";
+    for (const auto &[uid, thread] : std::map<std::int32_t, ThreadRecord>(thread_table.threads.begin(),
+                                                                           thread_table.threads.end())) {
+        std::cout << "[threads] uid=" << uid << " \"" << thread.name << "\" prio=" << thread.priority
+                  << " state=" << state_name(thread.state) << " pc=" << psprecomp::hex32(thread.suspended_context.pc)
+                  << " ra=" << psprecomp::hex32(thread.suspended_context.gpr[31]);
+        if (thread.state == ThreadState::Delayed) std::cout << " until=" << thread.delay_until_us;
+        if (const auto wait = waits.find(uid); wait != waits.end()) std::cout << " waiting " << wait->second;
+        std::cout << "\n";
+    }
+    if (pc_profile_enabled()) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> top(pc_profile_counts.begin(), pc_profile_counts.end());
+        std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+        if (top.size() > 40u) top.resize(40u);
+        for (const auto &[key, count] : top)
+            std::cout << "[pc-profile] uid=" << static_cast<std::int32_t>(key >> 32u)
+                      << " pc=" << psprecomp::hex32(static_cast<std::uint32_t>(key)) << " dispatches=" << count << "\n";
+    }
+    for (const auto &[uid, alarm] : alarms)
+        std::cout << "[threads] alarm uid=" << uid << " due=" << alarm.due_us << " handler=" << psprecomp::hex32(alarm.handler) << "\n";
 }
 
 void install_starvation_preemption() {

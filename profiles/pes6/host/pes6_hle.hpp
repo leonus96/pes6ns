@@ -32,4 +32,8 @@ void report_disc_read_stats();
 // Runtime object is still alive.
 void report_present_stats();
 
+// Prints every guest thread (state, suspended pc, what it waits on) and
+// pending alarms. Used to find what a stalled boot is waiting for.
+void report_thread_state();
+
 } // namespace pes6
