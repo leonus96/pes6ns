@@ -126,8 +126,8 @@ Trabajar primero en macOS/Linux, donde depurar es barato. Usar PPSSPP como orác
   - **Overlays (opción A, elegida por el usuario):** `scripts/extract_overlays.py` extrae los 36 overlays `MWo3` de `over.afs` y recompila AOT los 23 con código (incluido `game.ovl`, 3,4 MB); el host retira el código de una región al leer sobre ella y registra la traducción verificada (cabecera + hash) al saltar a ella. Framework: `--tag/--unit-base/--seeds` en `psp_recomp`, `unregister_code_range` y resolver de funciones faltantes en `Runtime`.
   - **Scratchpad** (16 KiB en `0x00010000`) añadido a `GuestMemory`.
   - *Estado (43f6d30):* `bootset.ovl` se ejecuta, 1800 vblanks sin fallos, **primeras imágenes**: panel de aviso con fundido; el texto sale mal decodificado. Después espera (¿botón? ¿memory stick?).
-- [ ] **4b. Primer frame:** completar HLE bloqueante (memoria, threads, IO, GE); presentar el framebuffer con SDL2 en escritorio.
-  - DoD: se ven los logos de Konami / pantalla de título.
+- [x] **4b. Primer frame:** completar HLE bloqueante (memoria, threads, IO, GE); presentar el framebuffer con SDL2 en escritorio.
+  - DoD: se ven los logos de Konami / pantalla de título. *(logo de KONAMI con fundido, vblank ~700; ventana SDL2 en `display_window_sdl.cpp`; diálogos del sistema y OSK con respuesta automática; vídeo de intro saltado con un override de la rutina de reproducción `0x088217C4`)*
 - [ ] **4c. Menús e input:** `sceCtrl` mapeado a teclado/mando SDL; navegación de menús.
   - DoD: se puede llegar a "Partido amistoso" y elegir equipos.
 - [ ] **4d. Partido jugable:** arreglar VFPU, rasterizado (geometría transformada, texturas, blending, depth), timing de vblank.

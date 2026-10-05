@@ -4407,6 +4407,124 @@ void notify_umd_callback() {
     found->second.notify_argument = 0x32u;
 }
 
+// sceUtility message dialog and on-screen keyboard. The PSP OS draws these
+// over the game; this host answers them automatically (logging what was
+// asked) and walks the same INIT -> VISIBLE -> QUIT -> FINISHED states.
+struct AutoDialogState {
+    UtilityStatus status{UtilityStatus::None};
+    std::uint32_t parameter{};
+    std::uint32_t updates{};
+};
+AutoDialogState message_dialog;
+AutoDialogState osk_dialog;
+
+std::string read_utf16_guest(const psprecomp::GuestMemory &memory, std::uint32_t address, std::size_t limit) {
+    std::string out;
+    for (std::size_t i = 0; address != 0u && i < limit && memory.contains(address + 2u * i, 2u); ++i) {
+        const std::uint16_t c = memory.load16(address + static_cast<std::uint32_t>(2u * i));
+        if (c == 0u) break;
+        out.push_back(c < 0x80u ? static_cast<char>(c) : '?');
+    }
+    return out;
+}
+
+void finish_message_dialog(psprecomp::GuestMemory &memory, std::uint32_t parameter) {
+    constexpr std::uint32_t kOptionsOffset = 0x23Cu, kButtonPressedOffset = 0x240u;
+    const std::uint32_t options = memory.load32(parameter + kOptionsOffset);
+    std::uint32_t pressed = 1u; // YES (or the only button)
+    if ((options & 0x10u) != 0u) {
+        const char *answer = std::getenv("PES6_DIALOG_ANSWER");
+        if (answer != nullptr && std::string(answer) == "no") pressed = 2u;
+    }
+    if (memory.contains(parameter + kButtonPressedOffset, 4u)) memory.store32(parameter + kButtonPressedOffset, pressed);
+    memory.store32(parameter + 0x1Cu, 0u); // common result
+    runtime_log_line(std::string("[dialog] answered ") + (pressed == 1u ? "yes/ok" : "no"));
+}
+
+void finish_osk(psprecomp::GuestMemory &memory, std::uint32_t parameter) {
+    const std::uint32_t count = memory.load32(parameter + 0x30u);
+    const std::uint32_t fields = memory.load32(parameter + 0x34u);
+    for (std::uint32_t i = 0; i < count && i < 16u; ++i) {
+        const std::uint32_t field = fields + i * 0x34u;
+        if (!memory.contains(field, 0x34u)) break;
+        const std::uint32_t initial = memory.load32(field + 0x20u);
+        const std::uint32_t output = memory.load32(field + 0x28u);
+        const std::uint32_t length = memory.load32(field + 0x24u);
+        // Keep the game's proposed text (PES6_OSK_TEXT overrides it).
+        std::u16string text;
+        if (const char *configured = std::getenv("PES6_OSK_TEXT"); configured != nullptr) {
+            for (const char *c = configured; *c != '\0'; ++c) text.push_back(static_cast<char16_t>(*c));
+        } else {
+            for (std::uint32_t j = 0; initial != 0u && j < 512u; ++j) {
+                const std::uint16_t c = memory.load16(initial + 2u * j);
+                if (c == 0u) break;
+                text.push_back(static_cast<char16_t>(c));
+            }
+        }
+        if (output != 0u && length != 0u) {
+            for (std::uint32_t j = 0; j < length; ++j)
+                memory.store16(output + 2u * j, j < text.size() && j + 1u < length ? text[j] : 0u);
+        }
+        memory.store32(field + 0x2Cu, 2u); // PSP_UTILITY_OSK_RESULT_CHANGED
+    }
+    memory.store32(parameter + 0x1Cu, 0u);
+}
+
+void install_auto_dialogs(psprecomp::Runtime &runtime) {
+    message_dialog = {};
+    osk_dialog = {};
+    struct Nids { std::uint32_t init, shutdown, update, status; AutoDialogState *state; bool osk; };
+    for (const Nids &nids : {Nids{0x2AD8E239u, 0x67AF3428u, 0x95FC253Bu, 0x9A1C91D7u, &message_dialog, false},
+                             Nids{0xF6269B82u, 0x3DFAEBA9u, 0x4B85C861u, 0xF3F76017u, &osk_dialog, true}}) {
+        AutoDialogState *state = nids.state;
+        const bool osk = nids.osk;
+        runtime.register_hle("sceUtility", nids.init,
+            [state, osk](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+                if (state->status != UtilityStatus::None) { ctx.set_gpr(2, 0x80110001u); return; }
+                const std::uint32_t parameter = ctx.gpr[4];
+                if (parameter == 0u || !rt.memory().contains(parameter, osk ? 0x40u : 0x244u)) {
+                    ctx.set_gpr(2, 0x80110004u);
+                    return;
+                }
+                *state = AutoDialogState{UtilityStatus::Init, parameter, 0u};
+                if (osk) {
+                    const std::uint32_t field = rt.memory().load32(parameter + 0x34u);
+                    runtime_log_line("[osk] \"" + read_utf16_guest(rt.memory(), rt.memory().load32(field + 0x1Cu), 128u) +
+                                     "\" initial=\"" + read_utf16_guest(rt.memory(), rt.memory().load32(field + 0x20u), 128u) + "\"");
+                } else {
+                    const std::uint32_t mode = rt.memory().load32(parameter + 0x34u);
+                    runtime_log_line(mode == 0u
+                        ? "[dialog] error " + psprecomp::hex32(rt.memory().load32(parameter + 0x38u))
+                        : "[dialog] \"" + rt.memory().read_c_string(parameter + 0x3Cu, 512u) + "\" options=" +
+                              psprecomp::hex32(rt.memory().load32(parameter + 0x23Cu)));
+                }
+                set_success(ctx);
+            });
+        runtime.register_hle("sceUtility", nids.update,
+            [state, osk](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+                if (state->status == UtilityStatus::Visible && ++state->updates >= 2u) {
+                    if (osk) finish_osk(rt.memory(), state->parameter);
+                    else finish_message_dialog(rt.memory(), state->parameter);
+                    state->status = UtilityStatus::Quit;
+                }
+                set_success(ctx);
+            });
+        runtime.register_hle("sceUtility", nids.status,
+            [state](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+                const UtilityStatus reported = state->status;
+                ctx.set_gpr(2, static_cast<std::uint32_t>(reported));
+                if (reported == UtilityStatus::Init) state->status = UtilityStatus::Visible;
+                else if (reported == UtilityStatus::Finished) *state = AutoDialogState{};
+            });
+        runtime.register_hle("sceUtility", nids.shutdown,
+            [state](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+                if (state->status != UtilityStatus::Quit) { ctx.set_gpr(2, 0x80110001u); return; }
+                state->status = UtilityStatus::Finished;
+                set_success(ctx);
+            });
+    }
+}
+
 constexpr std::int32_t kMainModuleUid = 0x3FF;
 constexpr std::int32_t kStdinFd = 0;
 constexpr std::int32_t kStdoutFd = 1;
@@ -4439,6 +4557,7 @@ void put_name32(std::vector<std::uint8_t> &bytes, std::size_t offset, const std:
 }
 
 void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
+    install_auto_dialogs(runtime);
     open_disc_image(runtime.game_root());
     alarms.clear();
     io_async_results.clear();
@@ -4735,6 +4854,25 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
             notify_umd_callback();
             set_success(ctx);
         });
+
+    // --- Movie skip (PES6-specific) ------------------------------------------------
+    // 0x088217C4 is the EBOOT's blocking "play PSMF movie" routine (title.ovl
+    // calls it with disc0:/PSP_GAME/USRDIR/pes6.pmf). Until sceMpeg decodes
+    // AVC/ATRAC, return at once as if the movie had finished.
+    // PES6_SKIP_MOVIES=0 plays them through the (stubbed) sceMpeg HLE instead.
+    static const bool skip_movies = [] {
+        const char *text = std::getenv("PES6_SKIP_MOVIES");
+        return text == nullptr || std::string(text) != "0";
+    }();
+    if (skip_movies) {
+        runtime.register_function(0x088217C4u,
+            [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+                runtime_log_line("[movie] skipped \"" + rt.memory().read_c_string(ctx.gpr[4], 128u) + "\"");
+                ctx.set_gpr(2, 0u);
+                ctx.pc = ctx.gpr[31];
+            },
+            "pes6_skip_movie");
+    }
 
     // --- sceUmdUser stubs ------------------------------------------------------
     for (const std::uint32_t nid : {0x4A9E5E29u /* WaitDriveStatCB */, 0x6AF9B50Au /* CancelWaitDriveStat */,

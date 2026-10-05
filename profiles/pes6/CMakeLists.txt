@@ -20,12 +20,30 @@ if(NOT MSVC)
 endif()
 
 file(GLOB PES6_HOST_SOURCES CONFIGURE_DEPENDS "${PES6_PROFILE_DIR}/host/*.cpp")
+list(FILTER PES6_HOST_SOURCES EXCLUDE REGEX "display_window_[a-z]+\\.cpp$")
+
+# Display/input backend: an SDL2 window when SDL2 is available (desktop, and
+# devkitPro's switch-sdl2), otherwise headless.
+option(PES6_USE_SDL2 "Build the SDL2 window/input backend when SDL2 is found" ON)
+if(PES6_USE_SDL2)
+    find_package(SDL2 CONFIG QUIET)
+endif()
+if(PES6_USE_SDL2 AND SDL2_FOUND)
+    list(APPEND PES6_HOST_SOURCES "${PES6_PROFILE_DIR}/host/display_window_sdl.cpp")
+    message(STATUS "PES6: SDL2 display backend")
+else()
+    list(APPEND PES6_HOST_SOURCES "${PES6_PROFILE_DIR}/host/display_window_headless.cpp")
+    message(STATUS "PES6: headless display backend")
+endif()
 
 add_executable(PES6Native ${PES6_HOST_SOURCES} ${PES6_GENERATED})
 target_include_directories(PES6Native PRIVATE
     "${PES6_PROFILE_DIR}/host"
     "${PES6_PROFILE_DIR}/generated")
 target_link_libraries(PES6Native PRIVATE psprecomp_core)
+if(PES6_USE_SDL2 AND SDL2_FOUND)
+    target_link_libraries(PES6Native PRIVATE SDL2::SDL2)
+endif()
 if(NOT NINTENDO_SWITCH)
     target_link_libraries(PES6Native PRIVATE ${CMAKE_DL_LIBS})
 endif()
