@@ -17,3 +17,6 @@ cmake -S "$repo" -B "$repo/out/framework" -G Ninja -DPSPRECOMP_PROFILE="" >/dev/
 cmake --build "$repo/out/framework" --target psp_recomp
 # 16 KiB units, like the VCS profile: smaller translation units compile faster.
 "$repo/out/framework/psp_recomp" "$eboot" --auto "$profile/generated" 0x08804000 16384
+# Code overlays PES6 loads at runtime from over.afs.
+python3 "$profile/scripts/extract_overlays.py" "$profile/game/PSP_GAME/USRDIR/over.afs" \
+    "$repo/out/framework/psp_recomp" "$profile" "$eboot"

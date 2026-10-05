@@ -15,6 +15,7 @@
 #include <fstream>
 #include <iostream>
 #include <iomanip>
+#include <optional>
 #include <map>
 #include <regex>
 #include <string_view>
@@ -825,9 +826,20 @@ std::string branch_condition(const psprecomp::DecodedInstruction &d) {
     }
 }
 
+// --tag: lets several automatic corpora (an executable and the overlays it
+// loads at runtime) link into one binary. It is inserted after the
+// "recomp_unit_" prefix, which the runtime uses to recognise chainable units.
+std::string g_symbol_tag;
+
+std::string tagged(const std::string &base) {
+    return g_symbol_tag.empty() ? base : base + "_" + g_symbol_tag;
+}
+
 std::string generated_unit_cpp_name(std::uint32_t unit) {
     std::ostringstream name;
-    name << "recomp_unit_" << std::setfill('0') << std::setw(4) << unit;
+    name << "recomp_unit_";
+    if (!g_symbol_tag.empty()) name << g_symbol_tag << '_';
+    name << std::setfill('0') << std::setw(4) << unit;
     return name.str();
 }
 
@@ -1452,7 +1464,9 @@ bool write_text_if_changed(const std::filesystem::path &path, const std::string 
 int generate_auto(const std::filesystem::path &elf_path,
                   const std::filesystem::path &output_dir,
                   std::uint32_t load_base,
-                  std::uint32_t unit_span_bytes) {
+                  std::uint32_t unit_span_bytes,
+                  std::optional<std::uint32_t> unit_base,
+                  const std::vector<std::uint32_t> &external_seeds) {
     const auto elf = psprecomp::Elf32Image::from_file(elf_path);
     psprecomp::GuestMemory memory;
     (void)elf.load_and_relocate(memory, load_base);
@@ -1460,11 +1474,16 @@ int generate_auto(const std::filesystem::path &elf_path,
     if (const auto module = elf.find_module_info(memory, load_base)) imports = elf.scan_imports(memory, *module);
     std::set<std::uint32_t> import_stubs;
     for (const auto &import : imports) import_stubs.insert(import.stub_address);
-    const auto program = psprecomp::analyze_program(elf, memory, load_base);
+    const auto program = psprecomp::analyze_program(elf, memory, load_base, external_seeds);
     if (program.executable_ranges.empty()) throw psprecomp::Error("ELF has no executable ranges");
 
     std::filesystem::create_directories(output_dir);
-    const std::uint32_t executable_base = program.executable_ranges.front().start;
+    // --unit-base aligns this corpus' unit buckets with another one's (an
+    // overlay with the executable that loads it), so both share the runtime's
+    // single dense unit layout.
+    const std::uint32_t executable_base = unit_base.value_or(program.executable_ranges.front().start);
+    if (executable_base > program.executable_ranges.front().start)
+        throw psprecomp::Error("--unit-base must not be above the first executable range");
 
     // Emit every discovered guest instruction once. Function seeds remain analysis
     // metadata and dispatcher entries, but overlapping CFGs no longer duplicate C++.
@@ -1515,7 +1534,8 @@ int generate_auto(const std::filesystem::path &elf_path,
     // External declarations let fixed cross-unit edges become native direct
     // calls. Under MSVC /GL + /LTCG the linker can optimize across these TUs
     // instead of forcing every known edge through a function-pointer branch.
-    const auto units_header_path = output_dir / "generated_units.hpp";
+    const std::string units_header_name = tagged("generated_units") + ".hpp";
+    const auto units_header_path = output_dir / units_header_name;
     std::ostringstream units_header;
     units_header << "#pragma once\n\n#include <cstdint>\n#include \"psprecomp/guest_memory.hpp\"\n\nnamespace psprecomp {\nclass Runtime;\nstruct AllegrexContext;\n";
     for (const auto &unit : units) {
@@ -1534,11 +1554,12 @@ int generate_auto(const std::filesystem::path &elf_path,
         std::ostringstream suffix;
         suffix << std::setfill('0') << std::setw(4) << unit.bucket;
         const std::string suffix_text = suffix.str();
-        const auto path = output_dir / ("generated_unit_" + suffix_text + ".cpp");
+        const auto path = output_dir / ((g_symbol_tag.empty() ? "generated_unit_" : "generated_unit_" + g_symbol_tag + "_") +
+                                        suffix_text + ".cpp");
         expected_cpp.insert(path.filename());
 
         const GeneratedFunctionInput generated_unit{
-            "recomp_unit_" + suffix_text,
+            generated_unit_cpp_name(unit.bucket),
             executable_base + unit.bucket * unit_span_bytes,
             unit.instructions,
             unit.entries,
@@ -1549,7 +1570,7 @@ int generate_auto(const std::filesystem::path &elf_path,
         };
 
         std::ostringstream out;
-        out << "#include \"psprecomp/runtime.hpp\"\n#include \"generated_units.hpp\"\n#include <bit>\n#include <cmath>\n#include <cstdint>\n#include <limits>\n\nnamespace psprecomp {\n";
+        out << "#include \"psprecomp/runtime.hpp\"\n#include \"" << units_header_name << "\"\n#include <bit>\n#include <cmath>\n#include <cstdint>\n#include <limits>\n\nnamespace psprecomp {\n";
         // The register-cache lowering passes (per-basic-block GPR/FPR caches and
         // the cross-unit hot-register cache) are deliberately absent.  They kept
         // large numbers of guest registers live in C++ locals and in a second
@@ -1563,7 +1584,7 @@ int generate_auto(const std::filesystem::path &elf_path,
                 lower_aot_memory_accesses(
                     lower_constant_fpr_accesses(
                         lower_constant_gpr_writes(emit_function_source(generated_unit, memory, generated_unit.name)))));
-        out << "void register_generated_unit_" << unit.bucket << "(Runtime &runtime) {\n";
+        out << "void " << tagged("register_generated_unit") << "_" << unit.bucket << "(Runtime &runtime) {\n";
         out << "    runtime.register_generated_unit(" << unit.bucket << "u, "
             << psprecomp::hex32(generated_unit.address) << "u, " << unit_span_bytes
             << "u, &" << generated_unit.name << ", &"
@@ -1577,15 +1598,17 @@ int generate_auto(const std::filesystem::path &elf_path,
         rewritten_units += write_text_if_changed(path, out.str()) ? 1u : 0u;
     }
 
-    const auto registry_path = output_dir / "generated_registry.cpp";
+    const auto registry_path = output_dir / (tagged("generated_registry") + ".cpp");
     expected_cpp.insert(registry_path.filename());
     std::ostringstream registry;
     registry << "#include \"psprecomp/runtime.hpp\"\n#include <cstdint>\n\nnamespace psprecomp {\n";
-    for (const auto &unit : units) registry << "void register_generated_unit_" << unit.bucket << "(Runtime &runtime);\n";
+    for (const auto &unit : units)
+        registry << "void " << tagged("register_generated_unit") << "_" << unit.bucket << "(Runtime &runtime);\n";
     registry << "\n";
     write_import_wrappers(registry, imports);
-    registry << "void register_generated_functions(Runtime &runtime) {\n";
-    for (const auto &unit : units) registry << "    register_generated_unit_" << unit.bucket << "(runtime);\n";
+    registry << "void " << tagged("register_generated_functions") << "(Runtime &runtime) {\n";
+    for (const auto &unit : units)
+        registry << "    " << tagged("register_generated_unit") << "_" << unit.bucket << "(runtime);\n";
     for (std::size_t i = 0; i < imports.size(); ++i) {
         registry << "    runtime.register_function(" << psprecomp::hex32(imports[i].stub_address)
                  << "u, &import_" << i << ", \"" << cpp_escape(imports[i].library)
@@ -1632,23 +1655,52 @@ int generate_auto(const std::filesystem::path &elf_path,
 int main(int argc, char **argv) {
     try {
         if (argc >= 4 && std::string_view(argv[2]) == "--auto") {
-            if (argc > 6) {
-                std::cerr << "Usage: psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]\n";
+            std::vector<std::string> positional;
+            std::optional<std::uint32_t> unit_base;
+            std::vector<std::uint32_t> external_seeds;
+            for (int i = 4; i < argc; ++i) {
+                const std::string_view arg = argv[i];
+                if (arg == "--tag" && i + 1 < argc) {
+                    g_symbol_tag = argv[++i];
+                    const bool valid = !g_symbol_tag.empty() &&
+                        std::all_of(g_symbol_tag.begin(), g_symbol_tag.end(), [](unsigned char c) {
+                            return std::isalnum(c) != 0 || c == '_';
+                        });
+                    if (!valid) throw psprecomp::Error("--tag must be a non-empty C identifier fragment");
+                } else if (arg == "--unit-base" && i + 1 < argc) {
+                    unit_base = static_cast<std::uint32_t>(std::stoul(argv[++i], nullptr, 0));
+                } else if (arg == "--seeds" && i + 1 < argc) {
+                    // One guest address per line (hex or decimal); '#' starts a comment.
+                    std::ifstream seeds_file(argv[++i]);
+                    if (!seeds_file) throw psprecomp::Error(std::string("Cannot read seeds file ") + argv[i]);
+                    for (std::string line; std::getline(seeds_file, line);) {
+                        line = line.substr(0, line.find('#'));
+                        if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
+                        external_seeds.push_back(static_cast<std::uint32_t>(std::stoul(line, nullptr, 0)));
+                    }
+                } else {
+                    positional.emplace_back(arg);
+                }
+            }
+            if (positional.size() > 2u) {
+                std::cerr << "Usage: psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]"
+                             " [--tag NAME] [--unit-base HEX] [--seeds FILE]\n";
                 return 2;
             }
-            const std::uint32_t load_base = argc >= 5
-                ? static_cast<std::uint32_t>(std::stoul(argv[4], nullptr, 0))
+            const std::uint32_t load_base = positional.size() >= 1u
+                ? static_cast<std::uint32_t>(std::stoul(positional[0], nullptr, 0))
                 : psprecomp::kDefaultPspUserLoadBase;
-            const std::uint32_t unit_span = argc >= 6
-                ? static_cast<std::uint32_t>(std::stoul(argv[5], nullptr, 0))
+            const std::uint32_t unit_span = positional.size() >= 2u
+                ? static_cast<std::uint32_t>(std::stoul(positional[1], nullptr, 0))
                 : 0x20000u;
             if (unit_span == 0u || (unit_span & 3u) != 0u) throw psprecomp::Error("unit_span_bytes must be non-zero and 4-byte aligned");
-            return generate_auto(argv[1], argv[3], load_base, unit_span);
+            return generate_auto(argv[1], argv[3], load_base, unit_span, unit_base, external_seeds);
         }
         if (argc == 4) return generate_manual(argv[1], argv[2], argv[3]);
         std::cerr << "Usage:\n"
                   << "  psp_recomp <ELF> <functions.csv> <generated_manifest.cpp>\n"
-                  << "  psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]\n";
+                  << "  psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]"
+                     " [--tag NAME] [--unit-base HEX] [--seeds FILE]\n";
         return 2;
     } catch (const std::exception &e) {
         std::cerr << "psp_recomp error: " << e.what() << "\n";

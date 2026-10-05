@@ -43,4 +43,13 @@ struct ProgramAnalysis {
                                               std::uint32_t load_base,
                                               std::size_t max_instructions_per_function = 131072u);
 
+// Same, plus entry points known from outside the image: code loaded at
+// runtime (overlays) is entered from the executable that loads it, so its
+// callers are invisible to an analysis of the overlay alone.
+[[nodiscard]] ProgramAnalysis analyze_program(const Elf32Image &elf,
+                                              const GuestMemory &memory,
+                                              std::uint32_t load_base,
+                                              const std::vector<std::uint32_t> &external_seeds,
+                                              std::size_t max_instructions_per_function = 131072u);
+
 } // namespace psprecomp

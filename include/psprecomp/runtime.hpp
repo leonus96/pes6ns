@@ -81,6 +81,16 @@ public:
     const NidRegistry &nids() const noexcept;
 
     void register_function(std::uint32_t address, RecompiledFunction function, std::string name);
+    // Removes every per-PC registration in [begin, end) and permanently
+    // disables the dense generated-unit fast path for the units it touches.
+    // Used for code a title loads at runtime (overlays): when new bytes land
+    // in such a region, the recompiled code of the previous occupant must stop
+    // being reachable before the next one is registered.
+    void unregister_code_range(std::uint32_t begin, std::uint32_t end);
+    // Called when the outer dispatcher finds no function at `pc`. Returning
+    // true means the resolver registered code for it and dispatch is retried.
+    using MissingFunctionResolver = bool (*)(Runtime &, std::uint32_t pc);
+    void set_missing_function_resolver(MissingFunctionResolver resolver) noexcept { missing_function_resolver_ = resolver; }
     void register_hle(std::string library, std::uint32_t nid, HleFunction function);
     [[nodiscard]] bool has_function(std::uint32_t address) const;
     [[nodiscard]] std::size_t function_count() const noexcept;
@@ -286,6 +296,7 @@ private:
     NidRegistry nids_;
     AllegrexContext cpu_;
     std::unordered_map<std::uint32_t, FunctionEntry> functions_;
+    MissingFunctionResolver missing_function_resolver_{};
     // Direct PC table, covering only the registered code window rather than all
     // of guest RAM.  direct_base_ is its 1 MiB-aligned first canonical address.
     std::vector<RecompiledFunction> direct_functions_;

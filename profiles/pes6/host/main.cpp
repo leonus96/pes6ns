@@ -10,6 +10,7 @@
 #include "display_window.hpp"
 #include "pes6_bootstrap_paths.hpp"
 #include "pes6_hle.hpp"
+#include "pes6_overlays.hpp"
 #include "pes6_runtime_log.hpp"
 
 #include <algorithm>
@@ -17,9 +18,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -90,6 +93,7 @@ int main(int argc, char **argv) {
         psprecomp::register_generated_functions(runtime);
         // Profile overrides must come after the generated corpus.
         pes6::install_profile(runtime, user_arena_start);
+        pes6::install_overlay_manager(runtime);
 
         std::cout << "PES6Native PSP bootstrap\n"
                   << "Executable: " << executable.string() << "\n"
@@ -117,7 +121,21 @@ int main(int argc, char **argv) {
         pes6::display_window_start();
         pes6::install_display_heartbeat();
         pes6::install_starvation_preemption();
-        runtime.run(elf.runtime_entry(), max_dispatches);
+        try {
+            runtime.run(elf.runtime_entry(), max_dispatches);
+        } catch (...) {
+            // PES6_CRASH_RAM_DUMP=<file>: snapshot the 32 MiB of user RAM
+            // (0x08000000..) at the failure for offline inspection.
+            if (const char *dump = std::getenv("PES6_CRASH_RAM_DUMP"); dump != nullptr && *dump != '\0') {
+                std::vector<std::uint8_t> ram(32u * 1024u * 1024u);
+                runtime.memory().copy_out(0x08000000u, ram);
+                std::ofstream(dump, std::ios::binary).write(reinterpret_cast<const char *>(ram.data()),
+                                                           static_cast<std::streamsize>(ram.size()));
+                std::cerr << "Guest RAM written to " << dump << "\n";
+            }
+            pes6::report_thread_state();
+            throw;
+        }
 
         std::cout << "Runtime stopped: " << runtime.stop_reason() << "\n";
         psprecomp::report_counted_pcs();

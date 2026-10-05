@@ -459,9 +459,18 @@ ProgramAnalysis analyze_program(const Elf32Image &elf,
                                 const GuestMemory &memory,
                                 std::uint32_t load_base,
                                 std::size_t max_instructions_per_function) {
+    return analyze_program(elf, memory, load_base, {}, max_instructions_per_function);
+}
+
+ProgramAnalysis analyze_program(const Elf32Image &elf,
+                                const GuestMemory &memory,
+                                std::uint32_t load_base,
+                                const std::vector<std::uint32_t> &external_seeds,
+                                std::size_t max_instructions_per_function) {
     ProgramAnalysis program{};
     program.executable_ranges = executable_ranges_for(elf, load_base);
     program.seeds = collect_initial_seeds(elf, memory, load_base, program.executable_ranges);
+    for (const auto seed : external_seeds) add_seed(program.seeds, program.executable_ranges, seed, "external_seed");
     program.functions.reserve(program.seeds.size());
 
     std::unordered_map<std::uint32_t, std::size_t> label_owners;

@@ -7,6 +7,7 @@
 // See profiles/pes6/progress/poda_hle.md for the full list.
 #include "pes6_hle.hpp"
 #include "pes6_runtime_log.hpp"
+#include "pes6_overlays.hpp"
 #include "audio_output.hpp"
 #include "display_window.hpp"
 #include "framebuffer_capture.hpp"
@@ -4368,6 +4369,14 @@ void register_io_sync(psprecomp::Runtime &runtime, std::uint32_t nid, psprecomp:
             if (runtime_log_enabled())
                 runtime_log_line("[io] open \"" + path + "\" flags=" + psprecomp::hex32(flags) +
                                  " -> " + psprecomp::hex32(ctx.gpr[2]));
+        };
+    }
+    if (nid == 0x6A638D83u) { // sceIoRead: tell the overlay manager what was overwritten
+        function = [inner = std::move(function)](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const std::uint32_t destination = ctx.gpr[5];
+            inner(rt, ctx);
+            const auto read = static_cast<std::int32_t>(ctx.gpr[2]);
+            if (read > 0) overlay_memory_written(rt, destination, static_cast<std::uint32_t>(read));
         };
     }
     io_sync_handlers[nid] = function;

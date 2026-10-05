@@ -448,6 +448,38 @@ void Runtime::register_function(std::uint32_t address, RecompiledFunction functi
     }
 }
 
+void Runtime::unregister_code_range(std::uint32_t begin, std::uint32_t end) {
+    if (end <= begin) return;
+    std::erase_if(functions_, [&](const auto &item) { return item.first >= begin && item.first < end; });
+    const std::uint32_t first = memory_.canonical(begin);
+    const std::uint64_t last = static_cast<std::uint64_t>(first) + (end - begin);
+    for (std::uint64_t c = first & ~3u; c < last; c += 4u) {
+        if (c < direct_base_) continue;
+        const std::size_t index = static_cast<std::size_t>(c - direct_base_) / 4u;
+        if (index >= direct_functions_.size()) break;
+        direct_functions_[index] = nullptr;
+        direct_chainable_[index] = nullptr;
+    }
+    if (generated_unit_span_ == 0u) return;
+    for (std::uint64_t c = first; c < last; c += generated_unit_span_) {
+        if (c < generated_unit_base_) continue;
+        const std::size_t unit_index = static_cast<std::size_t>((c - generated_unit_base_) / generated_unit_span_);
+        if (unit_index >= kGeneratedUnitFastCapacity) break;
+        generated_unit_disabled_[unit_index] = 1u;
+        generated_units_[unit_index] = nullptr;
+        generated_unit_entries_[unit_index] = nullptr;
+    }
+    // The last partial unit too.
+    if (last > generated_unit_base_) {
+        const std::size_t unit_index = static_cast<std::size_t>((last - 1u - generated_unit_base_) / generated_unit_span_);
+        if (unit_index < kGeneratedUnitFastCapacity) {
+            generated_unit_disabled_[unit_index] = 1u;
+            generated_units_[unit_index] = nullptr;
+            generated_unit_entries_[unit_index] = nullptr;
+        }
+    }
+}
+
 Runtime::RecompiledFunction Runtime::lookup_function(std::uint32_t address) const noexcept {
     const std::uint32_t c = memory_.canonical(address);
     const std::uint32_t delta = c - direct_base_;
@@ -586,6 +618,9 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
             chain_context_invalidated_ = false;
             const std::int32_t dispatch_thread_uid = g_runtime_thread_uid;
             RecompiledFunction function = lookup_function(before);
+            if (function == nullptr && missing_function_resolver_ != nullptr &&
+                missing_function_resolver_(*this, before))
+                function = lookup_function(before);
             if (function == nullptr) {
                 stop("No recompiled function registered at " + hex32(before));
                 return;
@@ -663,6 +698,9 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
             // back to exact per-PC dispatch automatically.
             RecompiledFunction function = lookup_generated_unit(before);
             if (function == nullptr) function = lookup_function(before);
+            if (function == nullptr && missing_function_resolver_ != nullptr &&
+                missing_function_resolver_(*this, before))
+                function = lookup_function(before);
             if (function == nullptr) {
                 stop("No recompiled function registered at " + hex32(before));
                 break;
@@ -721,6 +759,9 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
         const std::uint32_t before = cpu_.pc;
         chain_context_invalidated_ = false;
         RecompiledFunction function = lookup_function(before);
+        if (function == nullptr && missing_function_resolver_ != nullptr &&
+            missing_function_resolver_(*this, before))
+            function = lookup_function(before);
         const FunctionEntry *function_entry = lookup_entry(before);
         if (function == nullptr) {
             stop("No recompiled function registered at " + hex32(before));

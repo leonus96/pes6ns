@@ -4,7 +4,8 @@
 # scripts/regenerate.sh and is never committed (the repository is public).
 set(PES6_PROFILE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 
-file(GLOB PES6_GENERATED CONFIGURE_DEPENDS "${PES6_PROFILE_DIR}/generated/*.cpp")
+# The EBOOT corpus plus one sub-directory per recompiled overlay.
+file(GLOB_RECURSE PES6_GENERATED CONFIGURE_DEPENDS "${PES6_PROFILE_DIR}/generated/*.cpp")
 if(NOT PES6_GENERATED)
     message(FATAL_ERROR
         "profiles/pes6/generated is empty. Put your decrypted EBOOT at "

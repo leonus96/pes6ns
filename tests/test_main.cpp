@@ -838,6 +838,11 @@ int PSPRECOMP_TESTS_ENTRY() {
         require(!mem.contains(0x0A000000u), "RAM upper bound failed");
         mem.store16(0x08800010u, 0xA55Au);
         require(mem.load16(0x08800010u) == 0xA55Au, "Halfword memory access failed");
+        mem.store32(0x00013FFCu, 0xCAFEBABEu);
+        require(mem.load32(0x40013FFCu) == 0xCAFEBABEu, "Scratchpad access or uncached alias failed");
+        require(mem.aot_load32(0x00013FFCu) == 0xCAFEBABEu, "Scratchpad AOT slow path failed");
+        require(mem.contains(0x00010000u, 0x4000u) && !mem.contains(0x00014000u),
+                "Scratchpad bounds failed");
 
         {
             psprecomp::Runtime redispatch_runtime;
