@@ -120,7 +120,11 @@ struct VirtualDiscHandle {
     std::uint64_t base_offset{};
     std::uint64_t length{};
     std::uint64_t position{};
+    // umd0: is the UMD block device: seek offsets, read sizes and results
+    // count 2048-byte sectors instead of bytes.
+    bool sector_units{};
 };
+constexpr std::uint32_t kUmdSectorSize = 2048u;
 
 // Host file kept open across UMD sector reads. VCS streams assets in many
 // consecutive sceIoRead calls; reopening the same Windows file for every chunk
@@ -1264,6 +1268,7 @@ struct SubInterruptRecord {
     std::uint32_t argument{};
     bool enabled{};
     bool occurred{};
+    std::uint32_t gp{};
 };
 std::unordered_map<std::uint64_t, SubInterruptRecord> sub_interrupts;
 std::uint64_t sub_interrupt_key(std::uint32_t interrupt_number, std::uint32_t sub_number) {
@@ -3032,30 +3037,88 @@ struct AlarmRecord {
 std::int32_t next_alarm_uid{0x700};
 std::map<std::int32_t, AlarmRecord> alarms;
 
-// Alarm handlers run on a dedicated interrupt "thread" with the highest
-// priority, so they fire on time even when every guest thread is waiting:
-// the PSP delivers them from a timer interrupt, not from a running thread.
+// Alarm and VBLANK sub-interrupt handlers run on a dedicated interrupt
+// "thread" with the highest priority, so they fire on time even when every
+// guest thread is waiting: the PSP delivers them from timer/display
+// interrupts, not from a running thread. One handler runs at a time.
 constexpr std::int32_t kAlarmThreadUid = 0x7FFF;
 constexpr std::uint32_t kAlarmThreadStackSize = 0x4000u;
+constexpr std::uint32_t kVblankInterrupt = 30u;
 bool alarm_thread_busy{};
+bool alarm_thread_running_vblank{};
 std::int32_t alarm_thread_alarm_uid{};
 std::uint32_t alarm_gp{};
+// Sub-interrupt numbers of VBLANK handlers still to run for the current
+// vblank, in ascending order, and the last vblank (virtual time / period)
+// whose handlers were queued.
+std::deque<std::uint32_t> pending_vblank_handlers;
+std::uint64_t vblank_interrupt_tick{};
+
+bool any_vblank_handler_enabled() {
+    for (const auto &[key, record] : sub_interrupts) {
+        if ((key >> 32u) == kVblankInterrupt && record.enabled && record.handler != 0u) return true;
+    }
+    return false;
+}
 
 std::uint64_t earliest_alarm_due_us() {
     if (alarm_thread_busy) return UINT64_MAX;
     std::uint64_t earliest = UINT64_MAX;
     for (const auto &[uid, alarm] : alarms) earliest = std::min(earliest, alarm.due_us);
+    if (!pending_vblank_handlers.empty()) earliest = std::min(earliest, virtual_time_us);
+    else if (any_vblank_handler_enabled())
+        earliest = std::min(earliest, (vblank_interrupt_tick + 1u) * virtual_vblank_period_us());
     return earliest;
 }
 
-bool start_due_alarm_thread() {
-    if (alarm_thread_busy || alarms.empty()) return false;
-    auto due = alarms.end();
-    for (auto it = alarms.begin(); it != alarms.end(); ++it) {
-        if (it->second.due_us <= virtual_time_us && (due == alarms.end() || it->second.due_us < due->second.due_us))
-            due = it;
+void queue_vblank_handlers_if_due() {
+    const std::uint64_t tick = virtual_time_us / virtual_vblank_period_us();
+    if (tick <= vblank_interrupt_tick) return;
+    // A late check still raises one interrupt: the PSP does not replay
+    // vblanks it missed while interrupts were held off.
+    vblank_interrupt_tick = tick;
+    std::vector<std::uint32_t> sub_numbers;
+    for (const auto &[key, record] : sub_interrupts) {
+        if ((key >> 32u) == kVblankInterrupt && record.enabled && record.handler != 0u)
+            sub_numbers.push_back(static_cast<std::uint32_t>(key));
     }
-    if (due == alarms.end()) return false;
+    std::sort(sub_numbers.begin(), sub_numbers.end());
+    pending_vblank_handlers.insert(pending_vblank_handlers.end(), sub_numbers.begin(), sub_numbers.end());
+}
+
+bool start_due_alarm_thread() {
+    if (alarm_thread_busy) return false;
+    queue_vblank_handlers_if_due();
+    std::uint32_t handler = 0u;
+    std::uint32_t argument0 = 0u;
+    std::uint32_t argument1 = 0u;
+    std::uint32_t gp = alarm_gp;
+    while (!pending_vblank_handlers.empty() && handler == 0u) {
+        const std::uint32_t sub_number = pending_vblank_handlers.front();
+        const auto found = sub_interrupts.find(sub_interrupt_key(kVblankInterrupt, sub_number));
+        if (found == sub_interrupts.end() || !found->second.enabled || found->second.handler == 0u) {
+            pending_vblank_handlers.pop_front();
+            continue;
+        }
+        handler = found->second.handler;
+        argument0 = sub_number;
+        argument1 = found->second.argument;
+        gp = found->second.gp;
+        found->second.occurred = true;
+        alarm_thread_running_vblank = true;
+    }
+    auto due = alarms.end();
+    if (handler == 0u) {
+        for (auto it = alarms.begin(); it != alarms.end(); ++it) {
+            if (it->second.due_us <= virtual_time_us && (due == alarms.end() || it->second.due_us < due->second.due_us))
+                due = it;
+        }
+        if (due == alarms.end()) return false;
+        handler = due->second.handler;
+        argument0 = due->second.common;
+        alarm_thread_running_vblank = false;
+        alarm_thread_alarm_uid = due->first;
+    }
     auto thread = thread_table.threads.find(kAlarmThreadUid);
     if (thread == thread_table.threads.end()) {
         ThreadRecord record{};
@@ -3066,17 +3129,22 @@ bool start_due_alarm_thread() {
         thread = thread_table.threads.emplace(kAlarmThreadUid, record).first;
     }
     psprecomp::AllegrexContext context{};
-    context.set_gpr(28, alarm_gp);
+    context.set_gpr(28, gp);
     context.set_gpr(29, thread->second.stack_top - 0x40u);
-    context.set_gpr(4, due->second.common);
+    context.set_gpr(4, argument0);
+    context.set_gpr(5, argument1);
     context.set_gpr(31, 0x00000004u);
-    context.pc = due->second.handler;
+    context.pc = handler;
     alarm_thread_busy = true;
-    alarm_thread_alarm_uid = due->first;
     enqueue_continuation(kAlarmThreadUid, context);
-    if (std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr)
-        std::cerr << "[alarm] fire uid=" << due->first << " handler=" << psprecomp::hex32(due->second.handler)
-                  << " t=" << virtual_time_us << "\n";
+    if (std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr) {
+        if (alarm_thread_running_vblank)
+            std::cerr << "[intr] vblank sub=" << argument0 << " handler=" << psprecomp::hex32(handler)
+                      << " t=" << virtual_time_us << "\n";
+        else
+            std::cerr << "[alarm] fire uid=" << due->first << " handler=" << psprecomp::hex32(handler)
+                      << " t=" << virtual_time_us << "\n";
+    }
     return true;
 }
 
@@ -4248,10 +4316,14 @@ bool continue_mpeg_ringbuffer_callback(psprecomp::Runtime &runtime,
 
 void pes6_interrupt_return(psprecomp::Runtime &runtime, psprecomp::AllegrexContext &ctx) {
     if (thread_table.current_uid == kAlarmThreadUid) {
-        const std::uint32_t rearm_us = ctx.gpr[2];
-        if (const auto alarm = alarms.find(alarm_thread_alarm_uid); alarm != alarms.end()) {
-            if (rearm_us == 0u) alarms.erase(alarm);
-            else alarm->second.due_us = virtual_time_us + rearm_us;
+        if (alarm_thread_running_vblank) {
+            if (!pending_vblank_handlers.empty()) pending_vblank_handlers.pop_front();
+        } else {
+            const std::uint32_t rearm_us = ctx.gpr[2];
+            if (const auto alarm = alarms.find(alarm_thread_alarm_uid); alarm != alarms.end()) {
+                if (rearm_us == 0u) alarms.erase(alarm);
+                else alarm->second.due_us = virtual_time_us + rearm_us;
+            }
         }
         alarm_thread_busy = false;
         if (auto thread = thread_table.threads.find(kAlarmThreadUid); thread != thread_table.threads.end())
@@ -4417,6 +4489,12 @@ void consume_event_flag(EventFlagRecord &flag, std::uint32_t requested, std::uin
 // Synchronous IoFileMgr handlers, kept so the *Async variants can reuse them.
 std::unordered_map<std::uint32_t, psprecomp::Runtime::HleFunction> io_sync_handlers;
 
+// Bytes per unit of an fd's read sizes and seek offsets.
+std::uint32_t io_unit_bytes(std::int32_t fd) {
+    const auto found = file_table.virtual_disc_handles.find(fd);
+    return found != file_table.virtual_disc_handles.end() && found->second.sector_units ? kUmdSectorSize : 1u;
+}
+
 void register_io_sync(psprecomp::Runtime &runtime, std::uint32_t nid, psprecomp::Runtime::HleFunction function) {
     if (nid == 0x109F50BCu) { // sceIoOpen: log every guest path and its result
         function = [inner = std::move(function)](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
@@ -4431,9 +4509,10 @@ void register_io_sync(psprecomp::Runtime &runtime, std::uint32_t nid, psprecomp:
     if (nid == 0x6A638D83u) { // sceIoRead: tell the overlay manager what was overwritten
         function = [inner = std::move(function)](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
             const std::uint32_t destination = ctx.gpr[5];
+            const std::uint32_t unit = io_unit_bytes(static_cast<std::int32_t>(ctx.gpr[4]));
             inner(rt, ctx);
             const auto read = static_cast<std::int32_t>(ctx.gpr[2]);
-            if (read > 0) overlay_memory_written(rt, destination, static_cast<std::uint32_t>(read));
+            if (read > 0) overlay_memory_written(rt, destination, static_cast<std::uint32_t>(read) * unit);
         };
     }
     io_sync_handlers[nid] = function;
@@ -4668,6 +4747,9 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
     open_disc_image(runtime.game_root());
     alarms.clear();
     alarm_thread_busy = false;
+    alarm_thread_running_vblank = false;
+    pending_vblank_handlers.clear();
+    vblank_interrupt_tick = 0u;
     io_async_results.clear();
     io_async_ready_us.clear();
     umd_callback_uid = -1;
@@ -4877,7 +4959,7 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
             const std::uint32_t size = ctx.gpr[6];
             const std::uint64_t result = run_io_sync(0x6A638D83u, rt, ctx);
             io_async_results[fd] = static_cast<std::uint64_t>(sign_extend_result(result, false));
-            io_async_ready_us[fd] = virtual_time_us + umd_latency_us(size);
+            io_async_ready_us[fd] = virtual_time_us + umd_latency_us(size * io_unit_bytes(fd));
             if (runtime_log_enabled())
                 runtime_log_line("[io] readAsync fd=" + std::to_string(fd) + " dst=" + psprecomp::hex32(destination) +
                                  " size=" + psprecomp::hex32(size) + " -> " + psprecomp::hex32(static_cast<std::uint32_t>(result)));
@@ -6503,7 +6585,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 ctx.set_gpr(2, 0x80020067u);  // handler already present
                 return;
             }
-            sub_interrupts.emplace(key, SubInterruptRecord{handler, argument, false, false});
+            sub_interrupts.emplace(key, SubInterruptRecord{handler, argument, false, false, ctx.gpr[28]});
             if (std::getenv("PSPRECOMP_GE_DIAG") != nullptr) {
                 std::cerr << "[intr] register int=" << interrupt_number << " sub=" << sub_number
                           << " handler=" << psprecomp::hex32(handler)
@@ -6830,33 +6912,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             return;
         }
 
-        const auto interrupt = sub_interrupts.find(sub_interrupt_key(30u, 15u));
-        if (interrupt == sub_interrupts.end() || !interrupt->second.enabled || interrupt->second.handler == 0u) {
-            (void)delay_current_thread(rt, ctx, delay);
-            return;
-        }
-
-        const psprecomp::AllegrexContext resume = make_wait_context(ctx);
-        async_return_frames[thread_table.current_uid].push_back(
-            AsyncReturnFrame{AsyncReturnKind::SubInterrupt, resume});
-
-        psprecomp::AllegrexContext handler = ctx;
-        handler.set_gpr(4, 15u);
-        handler.set_gpr(5, interrupt->second.argument);
-        handler.set_gpr(31, 0x00000004u);
-        handler.pc = interrupt->second.handler;
-        current->second.state = ThreadState::Delayed;
-        current->second.suspended_context = handler;
-        current->second.delay_until_us = virtual_time_us + delay;
-        current->second.delay_sequence = thread_table.next_delay_sequence++;
-        interrupt->second.occurred = true;
-        if (std::getenv("PSPRECOMP_GE_DIAG") != nullptr) {
-            std::cerr << "[intr] schedule vblank uid=" << thread_table.current_uid
-                      << " handler=" << psprecomp::hex32(handler.pc)
-                      << " resume=" << psprecomp::hex32(resume.pc) << "\n";
-        }
-        if (!activate_next_thread(ctx, "vblank-wait"))
-            rt.stop("PSP scheduler deadlock while waiting for VBlank interrupt");
+        // VBLANK sub-interrupt handlers run on the interrupt thread when the
+        // virtual clock crosses the boundary (see start_due_alarm_thread).
+        (void)delay_current_thread(rt, ctx, delay);
     };
     runtime.register_hle("sceDisplay", 0x36CDFADEu, wait_vblank);
     runtime.register_hle("sceDisplay", 0x8EB9EC49u, wait_vblank);
@@ -7208,11 +7266,11 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         return &atrac_contexts[id];
     };
 
-    runtime.register_hle("sceAtrac3plus", 0x0FAE370Eu,
-        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
-            const std::uint32_t buffer = ctx.gpr[4];
-            const std::uint32_t read_size = ctx.gpr[5];
-            const std::uint32_t buffer_size = ctx.gpr[6];
+    // sceAtracSetHalfwayBufferAndGetID(buffer, readSize, bufferSize) and
+    // sceAtracSetDataAndGetID(buffer, bufferSize): the latter is the former
+    // with a fully loaded buffer.
+    const auto set_atrac_data = [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx,
+                                   std::uint32_t buffer, std::uint32_t read_size, std::uint32_t buffer_size) {
             if (read_size > buffer_size) { ctx.set_gpr(2, kAtracErrorIncorrectReadSize); return; }
             if (read_size < 12u || !rt.memory().contains(buffer, read_size)) {
                 ctx.set_gpr(2, kAtracErrorUnknownFormat); return;
@@ -7250,6 +7308,31 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                           << " source=\"" << state.source_path.string() << "\"\n";
             }
             ctx.set_gpr(2, static_cast<std::uint32_t>(id));
+        };
+    runtime.register_hle("sceAtrac3plus", 0x0FAE370Eu,
+        [set_atrac_data](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            set_atrac_data(rt, ctx, ctx.gpr[4], ctx.gpr[5], ctx.gpr[6]);
+        });
+    runtime.register_hle("sceAtrac3plus", 0x7A20E7AFu,
+        [set_atrac_data](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            set_atrac_data(rt, ctx, ctx.gpr[4], ctx.gpr[5], ctx.gpr[5]);
+        });
+    // sceAtracGetSecondBufferInfo: the second buffer only matters for a loop
+    // that ends inside the last streamed chunk; the decoder here reads the
+    // whole stream itself, so it is never needed.
+    runtime.register_hle("sceAtrac3plus", 0x83E85EA0u,
+        [get_atrac](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            if (!get_atrac(ctx.gpr[4])) { ctx.set_gpr(2, kAtracErrorBadId); return; }
+            for (const std::uint32_t address : {ctx.gpr[5], ctx.gpr[6]}) {
+                if (!rt.memory().contains(address, 4u)) { ctx.set_gpr(2, kAtracErrorBadAddress); return; }
+                rt.memory().store32(address, 0u);
+            }
+            ctx.set_gpr(2, 0x80630022u); // ATRAC_ERROR_SECOND_BUFFER_NOT_NEEDED
+        });
+    runtime.register_hle("sceAtrac3plus", 0x83BF7AFDu, // sceAtracSetSecondBuffer
+        [get_atrac](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            if (!get_atrac(ctx.gpr[4])) { ctx.set_gpr(2, kAtracErrorBadId); return; }
+            set_success(ctx);
         });
 
     runtime.register_hle("sceAtrac3plus", 0x61EB33F5u,
@@ -8817,6 +8900,12 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             // zero-length form as a capability probe before loading codec
             // modules.  It is a valid empty handle and does not require ISO
             // contents.
+            if ((path == "umd0:" || path == "umd1:" || path == "umd:") && disc_image.input.is_open()) {
+                const auto fd = file_table.next_fd++;
+                file_table.virtual_disc_handles.emplace(fd, VirtualDiscHandle{0u, disc_image.size, 0u, true});
+                ctx.set_gpr(2, static_cast<std::uint32_t>(fd));
+                return;
+            }
             if (path.rfind("disc0:/sce_lbn0x", 0u) == 0u) {
                 const auto size_marker = path.find("_size0x");
                 if (size_marker != std::string::npos) {
@@ -8916,10 +9005,12 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
             const std::uint64_t raw_offset = static_cast<std::uint64_t>(ctx.gpr[6]) |
                 (static_cast<std::uint64_t>(ctx.gpr[7]) << 32u);
-            const auto offset = static_cast<std::int64_t>(raw_offset);
+            auto offset = static_cast<std::int64_t>(raw_offset);
             const auto whence = static_cast<std::int32_t>(ctx.gpr[8]);
             if (auto virtual_handle = file_table.virtual_disc_handles.find(fd);
                 virtual_handle != file_table.virtual_disc_handles.end()) {
+                const std::int64_t unit = virtual_handle->second.sector_units ? kUmdSectorSize : 1;
+                offset *= unit;
                 std::int64_t base = 0;
                 if (whence == 1) base = static_cast<std::int64_t>(virtual_handle->second.position);
                 else if (whence == 2) base = static_cast<std::int64_t>(virtual_handle->second.length);
@@ -8935,8 +9026,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                     return;
                 }
                 virtual_handle->second.position = static_cast<std::uint64_t>(position);
-                ctx.set_gpr(2, static_cast<std::uint32_t>(position));
-                ctx.set_gpr(3, static_cast<std::uint32_t>(static_cast<std::uint64_t>(position) >> 32u));
+                ctx.set_gpr(2, static_cast<std::uint32_t>(position / unit));
+                ctx.set_gpr(3, static_cast<std::uint32_t>(static_cast<std::uint64_t>(position / unit) >> 32u));
                 if (std::getenv("PSPRECOMP_IO_DIAG") != nullptr)
                     std::cerr << "[io] sceIoLseek virtual fd=" << fd << " -> " << position << "\n";
                 return;
@@ -8979,24 +9070,26 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     runtime.register_hle("IoFileMgrForUser", 0x68963324u,
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
-            const auto offset = static_cast<std::int32_t>(ctx.gpr[5]);
             const auto whence = static_cast<std::int32_t>(ctx.gpr[6]);
             if (auto virtual_handle = file_table.virtual_disc_handles.find(fd);
                 virtual_handle != file_table.virtual_disc_handles.end()) {
+                const std::int64_t unit = virtual_handle->second.sector_units ? kUmdSectorSize : 1;
+                const std::int64_t offset = static_cast<std::int32_t>(ctx.gpr[5]) * unit;
                 std::int64_t base = 0;
                 if (whence == 1) base = static_cast<std::int64_t>(virtual_handle->second.position);
                 else if (whence == 2) base = static_cast<std::int64_t>(virtual_handle->second.length);
                 else if (whence != 0) { ctx.set_gpr(2, 0x80010016u); return; }
                 const std::int64_t position = base + offset;
                 if (position < 0 || static_cast<std::uint64_t>(position) > virtual_handle->second.length ||
-                    position > 0x7FFFFFFFll) {
+                    position / unit > 0x7FFFFFFFll) {
                     ctx.set_gpr(2, 0x80010016u);
                     return;
                 }
                 virtual_handle->second.position = static_cast<std::uint64_t>(position);
-                ctx.set_gpr(2, static_cast<std::uint32_t>(position));
+                ctx.set_gpr(2, static_cast<std::uint32_t>(position / unit));
                 return;
             }
+            const auto offset = static_cast<std::int32_t>(ctx.gpr[5]);
             const auto it = file_table.files.find(fd);
             if (it == file_table.files.end() || whence < 0 || whence > 2) {
                 ctx.set_gpr(2, 0x80010009u);
@@ -9034,9 +9127,15 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
             const std::uint32_t dst = ctx.gpr[5];
-            const std::uint32_t size = ctx.gpr[6];
+            std::uint32_t size = ctx.gpr[6];
             if (auto virtual_handle = file_table.virtual_disc_handles.find(fd);
                 virtual_handle != file_table.virtual_disc_handles.end()) {
+                const std::uint32_t unit = virtual_handle->second.sector_units ? kUmdSectorSize : 1u;
+                if (size > 0xFFFFFFFFu / unit) {
+                    ctx.set_gpr(2, 0x80010016u);
+                    return;
+                }
+                size *= unit;
                 if (!rt.memory().contains(dst, size)) {
                     ctx.set_gpr(2, 0x80010009u);
                     return;
@@ -9058,7 +9157,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                     std::cerr << "[io] sceIoRead virtual fd=" << fd << " size=" << size << " -> " << read << "\n";
                 // Host I/O completes synchronously. (VCS deferred the reading
                 // thread here to replay GTA's world-stream submitter ordering.)
-                ctx.set_gpr(2, static_cast<std::uint32_t>(read));
+                ctx.set_gpr(2, static_cast<std::uint32_t>(read / unit));
                 return;
             }
             if (file_table.synthetic_empty_files.contains(fd)) {
