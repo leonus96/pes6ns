@@ -98,8 +98,8 @@ Cada fase tiene **tareas**, **criterio de terminado (DoD)** y **estimación** pa
 ### Fase 2 — Framework PSPRecomp en escritorio  *(2–5 días)*
 - [x] Fork de PSPRecomp; compilar solo el framework en macOS: `cmake -S . -B out/framework -DPSPRECOMP_PROFILE=""` y correr `ctest`. *(compila y `ctest` pasa en macOS y Linux sin cambios. Extra: el framework completo también compila y enlaza para Switch con devkitA64 sin cambios)*
 - [ ] Arreglar lo que dependa de MSVC/Windows en el framework (no en `vcs`), manteniendo los cambios genéricos y aislados (candidatos a PR upstream).
-- [ ] Leer `docs/PROFILE_GUIDE.md`, `docs/SOURCE_PROVENANCE.md` y recorrer `profiles/vcs/host` para entender: bootstrap, `Runtime::register_hle()`, `register_function()`, `register_native_fast_path()`, backend GE por software.
-- [ ] Documentar en `progress/` un mapa de cómo fluye un frame en el perfil VCS (display list GE → rasterizador CPU → presentación).
+- [x] Leer `docs/PROFILE_GUIDE.md`, `docs/SOURCE_PROVENANCE.md` y recorrer `profiles/vcs/host` para entender: bootstrap, `Runtime::register_hle()`, `register_function()`, `register_native_fast_path()`, backend GE por software.
+- [x] Documentar en `progress/` un mapa de cómo fluye un frame en el perfil VCS (display list GE → rasterizador CPU → presentación). *(`progress/arquitectura_vcs.md`. Hallazgos clave: el HLE (~226 funciones) vive en `profiles/vcs/host/vcs_profile.cpp`, no en el framework; fuera de Windows el perfil es headless; ATRAC3+/MPEG se decodifican buscando archivos sueltos — no servirá con los `.afs` de PES6)*
 
 - [x] (Extra) `switch/selftest`: `.nro` que corre los tests del framework en la consola (`PSPRECOMP_TESTS_NO_SUBPROCESS` omite los 7 tests que lanzan `psp_recomp`). **PASS en la consola (113 ms)** tras corregir `Runtime::set_game_root` para rutas `sdmc:`.
 
