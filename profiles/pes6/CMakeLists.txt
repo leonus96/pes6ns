@@ -20,20 +20,42 @@ if(NOT MSVC)
 endif()
 
 file(GLOB PES6_HOST_SOURCES CONFIGURE_DEPENDS "${PES6_PROFILE_DIR}/host/*.cpp")
-list(FILTER PES6_HOST_SOURCES EXCLUDE REGEX "display_window_[a-z]+\\.cpp$")
+list(FILTER PES6_HOST_SOURCES EXCLUDE REGEX "(display_window|audio_device|atrac_decoder)_[a-z]+\\.cpp$")
 
-# Display/input backend: an SDL2 window when SDL2 is available (desktop, and
-# devkitPro's switch-sdl2), otherwise headless.
+# Display/input and audio backends: an SDL2 window and audio device when SDL2 is
+# available (desktop, and devkitPro's switch-sdl2), otherwise headless/silent.
 option(PES6_USE_SDL2 "Build the SDL2 window/input backend when SDL2 is found" ON)
 if(PES6_USE_SDL2)
     find_package(SDL2 CONFIG QUIET)
 endif()
 if(PES6_USE_SDL2 AND SDL2_FOUND)
-    list(APPEND PES6_HOST_SOURCES "${PES6_PROFILE_DIR}/host/display_window_sdl.cpp")
-    message(STATUS "PES6: SDL2 display backend")
+    list(APPEND PES6_HOST_SOURCES
+        "${PES6_PROFILE_DIR}/host/display_window_sdl.cpp"
+        "${PES6_PROFILE_DIR}/host/audio_device_sdl.cpp")
+    message(STATUS "PES6: SDL2 display and audio backend")
 else()
-    list(APPEND PES6_HOST_SOURCES "${PES6_PROFILE_DIR}/host/display_window_headless.cpp")
-    message(STATUS "PES6: headless display backend")
+    list(APPEND PES6_HOST_SOURCES
+        "${PES6_PROFILE_DIR}/host/display_window_headless.cpp"
+        "${PES6_PROFILE_DIR}/host/audio_device_null.cpp")
+    message(STATUS "PES6: headless display backend, no audio device")
+endif()
+
+# ATRAC3/ATRAC3plus music: libavcodec + libavutil (LGPL, linked, not vendored)
+# when pkg-config finds them -- Homebrew's ffmpeg on macOS, devkitPro's
+# switch-ffmpeg on Switch.  Without them ATRAC streams play as silence.
+option(PES6_USE_FFMPEG "Decode ATRAC music with FFmpeg's libavcodec when found" ON)
+if(PES6_USE_FFMPEG)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(PES6_FFMPEG IMPORTED_TARGET libavcodec libavutil)
+    endif()
+endif()
+if(PES6_USE_FFMPEG AND PES6_FFMPEG_FOUND)
+    list(APPEND PES6_HOST_SOURCES "${PES6_PROFILE_DIR}/host/atrac_decoder_ffmpeg.cpp")
+    message(STATUS "PES6: ATRAC decoding with FFmpeg ${PES6_FFMPEG_libavcodec_VERSION}")
+else()
+    list(APPEND PES6_HOST_SOURCES "${PES6_PROFILE_DIR}/host/atrac_decoder_null.cpp")
+    message(STATUS "PES6: no FFmpeg, ATRAC music will be silent")
 endif()
 
 add_executable(PES6Native ${PES6_HOST_SOURCES} ${PES6_GENERATED})
@@ -43,6 +65,9 @@ target_include_directories(PES6Native PRIVATE
 target_link_libraries(PES6Native PRIVATE psprecomp_core)
 if(PES6_USE_SDL2 AND SDL2_FOUND)
     target_link_libraries(PES6Native PRIVATE SDL2::SDL2)
+endif()
+if(PES6_USE_FFMPEG AND PES6_FFMPEG_FOUND)
+    target_link_libraries(PES6Native PRIVATE PkgConfig::PES6_FFMPEG)
 endif()
 if(NOT NINTENDO_SWITCH)
     target_link_libraries(PES6Native PRIVATE ${CMAKE_DL_LIBS})

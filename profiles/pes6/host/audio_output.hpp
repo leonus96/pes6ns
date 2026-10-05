@@ -5,9 +5,8 @@
 
 namespace pes6 {
 
-// Host audio sink for the sceAudio HLE. Implementations: audio_output_null.cpp
-// (silent, default); a real backend (SDL2 / libnx audren) can replace it later
-// behind this same interface.  The PSP exposes eight regular PCM
+// Host audio sink for the sceAudio HLE, implemented by audio_output.cpp on top
+// of a native device (audio_device.hpp).  The PSP exposes eight regular PCM
 // channels plus one SRC/Output2 channel; submissions are mixed on the guest's
 // virtual-time line before they are handed to the native audio device.
 [[nodiscard]] bool audio_output_enabled();

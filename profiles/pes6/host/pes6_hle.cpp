@@ -8,6 +8,7 @@
 #include "pes6_hle.hpp"
 #include "pes6_runtime_log.hpp"
 #include "pes6_overlays.hpp"
+#include "atrac_decoder.hpp"
 #include "audio_output.hpp"
 #include "display_window.hpp"
 #include "framebuffer_capture.hpp"
@@ -58,10 +59,10 @@ namespace {
 // ---------------------------------------------------------------------------
 // Media decoding stubs.
 //
-// The VCS host decoded ATRAC3+ and PMF video with an in-process FFmpeg build
-// (vcs_media_decoder.*). The PES6 host does not link FFmpeg yet: these stand-ins
-// keep the sceAtrac3plus / sceMpeg bookkeeping intact while every open() fails,
-// so ATRAC decodes produce silence and AVC decodes report "no frame".
+// The VCS host decoded PMF video with an in-process FFmpeg build
+// (vcs_media_decoder.*). These stand-ins keep the sceMpeg bookkeeping intact
+// while every open() fails, so AVC decodes report "no frame".  ATRAC has its
+// own frame decoder (atrac_decoder.hpp).
 // ---------------------------------------------------------------------------
 void log_media_stub_once(const char *what) {
     static std::unordered_set<std::string> reported;
@@ -70,18 +71,6 @@ void log_media_stub_once(const char *what) {
                   << " decoding is not available in this build (no FFmpeg); "
                      "producing silence / no frame\n";
 }
-
-class AudioStreamDecoder {
-public:
-    [[nodiscard]] bool open(const std::filesystem::path &, std::uint32_t, std::uint32_t,
-                            std::uint64_t) {
-        log_media_stub_once("ATRAC3/ATRAC3+");
-        return false;
-    }
-    [[nodiscard]] std::size_t read(std::span<std::uint8_t>) { return 0u; }
-    [[nodiscard]] bool is_open() const noexcept { return false; }
-    void close() noexcept {}
-};
 
 class PmfAudioDecoder {
 public:
@@ -196,6 +185,14 @@ struct ParsedAtracHeader {
     std::int32_t loop_start{-1};
     std::int32_t loop_end{-1};
     bool atrac3plus{};
+    // Second word of the fact chunk: decoder samples before the first audible
+    // one (encoder delay).  total_samples counts audible samples only, while
+    // the smpl loop points are in decoder samples: for every PES6 stream
+    // total_samples + first_sample_offset lands just past loop_end and inside
+    // the last frame.
+    std::uint32_t first_sample_offset{};
+    // fmt chunk past its 18-byte WAVEFORMATEX head (ATRAC3 codec parameters).
+    std::vector<std::uint8_t> fmt_extension;
 };
 
 struct AtracContextState {
@@ -211,9 +208,26 @@ struct AtracContextState {
     std::uint64_t sample_position{};
     std::int32_t loop_num{};
     std::uint32_t internal_error{};
-    std::filesystem::path source_path;
-    AudioStreamDecoder decoder;
-    bool decoder_eof{};
+    // The whole file sits in the guest buffer (sceAtracSetData, or a halfway
+    // buffer that already holds everything): frames are read from there by
+    // position.  Otherwise frames come from `encoded`.
+    bool fully_loaded{};
+    // Encoded data the game handed over (initial read, then every
+    // sceAtracAddStreamData), copied out in play order, so decoding never has
+    // to reason about where the guest ring buffer wrapped.
+    std::vector<std::uint8_t> encoded;
+    std::size_t encoded_read{};
+    // File offset of encoded[encoded_read], and where the stream continues
+    // each time the game's feed wrapped back to a loop start (one entry per
+    // wrap, consumed when the head reaches the end of the data chunk).
+    std::uint64_t encoded_file_offset{};
+    std::deque<std::uint64_t> encoded_wraps;
+    // Frame the decoder will be fed next; frames before the one holding the
+    // current position are decoded and discarded to prime it.
+    std::uint64_t decoder_next_frame{};
+    AtracFrameDecoder decoder;
+    bool decoder_failed{};
+    std::uint32_t underflows{};
 };
 
 std::uint32_t read_be32(std::span<const std::uint8_t> bytes, std::size_t offset) {
@@ -823,9 +837,13 @@ bool parse_atrac_header(std::span<const std::uint8_t> bytes, ParsedAtracHeader &
             header.average_bytes_per_second = read_le32(bytes, payload + 8u);
             header.block_align = read_le16(bytes, payload + 12u);
             header.bits_per_sample = read_le16(bytes, payload + 14u);
+            if (chunk_size > 18u)
+                header.fmt_extension.assign(bytes.begin() + static_cast<std::ptrdiff_t>(payload + 18u),
+                                            bytes.begin() + static_cast<std::ptrdiff_t>(payload + chunk_size));
             have_fmt = true;
         } else if (std::memcmp(bytes.data() + offset, "fact", 4u) == 0 && chunk_size >= 4u) {
             header.total_samples = read_le32(bytes, payload);
+            if (chunk_size >= 8u) header.first_sample_offset = read_le32(bytes, payload + 4u);
         } else if (std::memcmp(bytes.data() + offset, "smpl", 4u) == 0 && chunk_size >= 60u) {
             const std::uint32_t loop_count = read_le32(bytes, payload + 28u);
             if (loop_count != 0u && chunk_size >= 60u) {
@@ -851,24 +869,6 @@ bool parse_atrac_header(std::span<const std::uint8_t> bytes, ParsedAtracHeader &
     return true;
 }
 
-std::filesystem::path identify_atrac_source(std::span<const std::uint8_t> header, const ParsedAtracHeader &parsed) {
-    const std::size_t compare_size = std::min<std::size_t>(header.size(), 256u);
-    for (const auto &[key, file] : file_table.virtual_files_by_path) {
-        if (file.size != parsed.file_size) continue;
-        std::string extension = file.native_path.extension().string();
-        std::transform(extension.begin(), extension.end(), extension.begin(),
-                       [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
-        if (extension != ".AT3" && extension != ".AA3" && extension != ".OMA") continue;
-        std::vector<std::uint8_t> candidate(compare_size);
-        std::ifstream input(file.native_path, std::ios::binary);
-        if (!input) continue;
-        input.read(reinterpret_cast<char *>(candidate.data()), static_cast<std::streamsize>(candidate.size()));
-        if (input.gcount() == static_cast<std::streamsize>(candidate.size()) &&
-            std::equal(candidate.begin(), candidate.end(), header.begin())) return file.native_path;
-    }
-    return {};
-}
-
 // sceAtracDecodeData always hands the caller two interleaved channels: the PSP
 // decoder upmixes a mono stream instead of returning half-width frames, and
 // nothing in the API lets a game ask for anything else (this EBOOT does not
@@ -880,48 +880,141 @@ constexpr std::uint32_t kAtracOutputChannels = 2u;
 
 void close_atrac_decoder(AtracContextState &state) {
     state.decoder.close();
-    state.decoder_eof = false;
+    state.decoder_failed = false;
 }
 
-bool open_atrac_decoder(AtracContextState &state) {
-    if (state.decoder.is_open()) return true;
-    if (state.source_path.empty()) {
-        log_media_stub_once("ATRAC3/ATRAC3+ (no loose source file)");
-        return false;
-    }
-    // Clamp the seek to the stream. A reopen was observed at sample 159,114,619
-    // on EMOTION.AT3 -- an hour of audio into a track a few minutes long -- which
-    // sends the demuxer hunting past end of file for a position that cannot
-    // exist. sample_position accumulates across decodes and nothing bounded it
-    // here; whatever lets it run away is a separate bug, but the seek itself
-    // must stay inside the file.
-    std::uint64_t seek = state.sample_position;
-    if (state.header.total_samples != 0u && seek > state.header.total_samples) {
-        if (std::getenv("PSPRECOMP_ATRAC_DIAG") != nullptr)
-            std::cerr << "[atrac] seek " << seek << " fora do stream (total="
-                      << state.header.total_samples << "), limitado\n";
-        seek = state.header.total_samples;
-    }
-    if (!state.decoder.open(state.source_path, state.header.sample_rate,
-                            kAtracOutputChannels, seek))
-        return false;
-    state.decoder_eof = false;
-    if (std::getenv("PSPRECOMP_ATRAC_DIAG") != nullptr)
-        std::cerr << "[atrac] decoder opened id-source=\"" << state.source_path.string()
-                  << "\" sample=" << state.sample_position << "\n";
-    return true;
+std::uint32_t atrac_samples_per_frame(const AtracContextState &state);
+
+// Positions the game sees (sample_position, sceAtracResetPlayPosition) count
+// audible samples; the decoder's run first_sample_offset samples ahead.
+std::uint64_t atrac_decoder_sample(const AtracContextState &state, std::uint64_t sample) {
+    return sample + state.header.first_sample_offset;
 }
 
-std::size_t read_atrac_pcm(AtracContextState &state, std::span<std::uint8_t> output) {
-    if (!open_atrac_decoder(state)) {
-        // No decoder in this build: emit silence for the requested frame so
-        // the stream advances at its real rate and finishes normally.
-        std::fill(output.begin(), output.end(), std::uint8_t{0});
-        return output.size();
+// File offset of the frame holding decoder sample `decoder_sample`.
+std::uint64_t atrac_frame_file_offset(const AtracContextState &state, std::uint64_t decoder_sample) {
+    return static_cast<std::uint64_t>(state.header.data_offset) +
+        (decoder_sample / atrac_samples_per_frame(state)) * state.header.block_align;
+}
+
+std::uint64_t atrac_data_end(const AtracContextState &state) {
+    return std::min<std::uint64_t>(static_cast<std::uint64_t>(state.header.data_offset) +
+                                       state.header.data_size, state.header.file_size);
+}
+
+// Audible end of the stream for the current loop setting: past the loop end
+// while loops remain, the last audible sample otherwise.
+std::uint64_t atrac_stream_end(const AtracContextState &state) {
+    const auto &header = state.header;
+    if (state.loop_num != 0 && header.loop_start >= 0 && header.loop_end >= 0 &&
+        static_cast<std::uint32_t>(header.loop_end) >= header.first_sample_offset) {
+        return std::min<std::uint64_t>(
+            static_cast<std::uint64_t>(header.loop_end) + 1u - header.first_sample_offset,
+            header.total_samples);
     }
-    const std::size_t total = state.decoder.read(output);
-    if (total < output.size()) state.decoder_eof = true;
-    return total;
+    return header.total_samples;
+}
+
+std::uint64_t atrac_loop_start(const AtracContextState &state) {
+    const auto start = static_cast<std::uint64_t>(std::max(state.header.loop_start, 0));
+    return start > state.header.first_sample_offset ? start - state.header.first_sample_offset : 0u;
+}
+
+std::uint32_t atrac_streamed_bytes(const AtracContextState &state) {
+    return static_cast<std::uint32_t>(state.encoded.size() - state.encoded_read);
+}
+
+void atrac_append_stream(AtracContextState &state, std::span<const std::uint8_t> bytes) {
+    // Drop what was already decoded before growing, so the copy stays about
+    // one guest buffer long.
+    if (state.encoded_read >= 64u * 1024u) {
+        state.encoded.erase(state.encoded.begin(),
+                            state.encoded.begin() + static_cast<std::ptrdiff_t>(state.encoded_read));
+        state.encoded_read = 0u;
+    }
+    state.encoded.insert(state.encoded.end(), bytes.begin(), bytes.end());
+}
+
+// Takes the next streamed frame; returns its frame index, or -1 if the game
+// has not streamed it yet.
+std::int64_t atrac_pop_streamed_frame(AtracContextState &state, std::span<std::uint8_t> frame) {
+    const std::uint32_t align = state.header.block_align;
+    if (atrac_streamed_bytes(state) < align) return -1;
+    if (state.encoded_file_offset >= atrac_data_end(state) && !state.encoded_wraps.empty()) {
+        state.encoded_file_offset = state.encoded_wraps.front();
+        state.encoded_wraps.pop_front();
+    }
+    const auto index = static_cast<std::int64_t>(
+        (state.encoded_file_offset - state.header.data_offset) / align);
+    std::copy_n(state.encoded.begin() + static_cast<std::ptrdiff_t>(state.encoded_read), align, frame.begin());
+    state.encoded_read += align;
+    state.encoded_file_offset += align;
+    return index;
+}
+
+// Decodes what DecodeData returns at state.sample_position: the rest of the
+// frame holding it, interleaved stereo in `pcm` (at most one frame).  Returns
+// the stereo samples produced.  A frame that cannot be decoded -- no decoder
+// in this build, or not streamed in time -- comes out as silence, so the
+// stream still advances at its real rate and finishes normally.
+std::uint32_t decode_atrac_frame(psprecomp::Runtime &rt, AtracContextState &state,
+                                 std::span<std::int16_t> pcm) {
+    const std::uint32_t align = state.header.block_align;
+    const std::uint32_t frame_samples = atrac_samples_per_frame(state);
+    const std::uint64_t decoder_sample = atrac_decoder_sample(state, state.sample_position);
+    const std::uint64_t target = decoder_sample / frame_samples;
+    const auto skip = static_cast<std::uint32_t>(decoder_sample % frame_samples);
+    const std::uint32_t produced = frame_samples - skip;
+    std::fill(pcm.begin(), pcm.end(), std::int16_t{0});
+
+    if (!state.decoder.is_open() && !state.decoder_failed) {
+        state.decoder_failed = !state.decoder.open(state.header.atrac3plus, state.header.channels,
+                                                   state.header.sample_rate, align,
+                                                   state.header.fmt_extension);
+    }
+    static std::vector<std::uint8_t> frame;
+    static std::vector<std::int16_t> scratch;
+    frame.resize(align);
+    scratch.resize(static_cast<std::size_t>(frame_samples) * 2u);
+
+    if (state.fully_loaded) {
+        // Random access: after a seek or loop backwards, restart the decoder
+        // one frame early so the target frame comes out primed.
+        if (target < state.decoder_next_frame || target > state.decoder_next_frame + 1u) {
+            state.decoder.reset();
+            state.decoder_next_frame = target > 0u ? target - 1u : 0u;
+        }
+        for (; state.decoder_next_frame <= target; ++state.decoder_next_frame) {
+            const std::uint64_t offset = static_cast<std::uint64_t>(state.header.data_offset) +
+                state.decoder_next_frame * align;
+            if (offset + align > state.initial_read_size) return produced;
+            rt.memory().copy_out(state.buffer_address + static_cast<std::uint32_t>(offset), frame);
+            if (!state.decoder.is_open()) continue;
+            const std::uint32_t decoded = state.decoder.decode(frame, scratch);
+            if (state.decoder_next_frame == target && decoded > skip)
+                std::copy_n(scratch.begin() + skip * 2u, (decoded - skip) * 2u, pcm.begin());
+        }
+        return produced;
+    }
+
+    // Streamed: frames arrive in play order.  Frames ahead of the target --
+    // the encoder-delay frame at the start, the tail past a loop end -- are
+    // decoded (to keep the decoder primed) and discarded.
+    for (int guard = 0; guard < 64; ++guard) {
+        const std::int64_t index = atrac_pop_streamed_frame(state, frame);
+        if (index < 0) {
+            ++state.underflows;
+            if (std::getenv("PSPRECOMP_ATRAC_DIAG") != nullptr)
+                std::cerr << "[atrac] underflow at sample " << state.sample_position
+                          << " streamed=" << atrac_streamed_bytes(state) << "\n";
+            return produced;
+        }
+        const std::uint32_t decoded = state.decoder.is_open() ? state.decoder.decode(frame, scratch) : 0u;
+        if (static_cast<std::uint64_t>(index) != target) continue;
+        if (decoded > skip) std::copy_n(scratch.begin() + skip * 2u, (decoded - skip) * 2u, pcm.begin());
+        return produced;
+    }
+    return produced;
 }
 
 std::uint32_t atrac_samples_per_frame(const AtracContextState &state) {
@@ -1592,7 +1685,20 @@ void sas_log_mix_checkpoint(const char *kind, std::uint64_t count) {
                   << " dry=" << sas_state.reverb.dry
                   << " wet=" << sas_state.reverb.wet
                   << " effect_type=" << sas_state.reverb.type
-                  << " grain=" << sas_state.grain_size << "\n";
+                  << " grain=" << sas_state.grain_size;
+        if (std::getenv("PSPRECOMP_SAS_DIAG") != nullptr) {
+            const auto &reverb = sas_state.reverb;
+            std::cerr << " evol=" << reverb.left_volume << "," << reverb.right_volume
+                      << " delay=" << reverb.delay << " feedback=" << reverb.feedback;
+            for (std::size_t index = 0u; index < sas_state.voices.size(); ++index) {
+                const auto &voice = sas_state.voices[index];
+                if (!voice.playing || voice.paused) continue;
+                std::cerr << " v" << index << "[vol=" << voice.left_volume << "," << voice.right_volume
+                          << " fx=" << voice.effect_left_volume << "," << voice.effect_right_volume
+                          << " env=" << (voice.envelope_height >> 20) << " pitch=" << voice.pitch << "]";
+            }
+        }
+        std::cerr << "\n";
     }
 }
 
@@ -2137,6 +2243,24 @@ void sas_mix_into(psprecomp::Runtime &rt, std::uint32_t output, std::uint32_t fr
             static_cast<std::int16_t>(std::clamp<std::int64_t>(l, -32768, 32767))));
         rt.memory().store16(output + frame * 4u + 2u, static_cast<std::uint16_t>(
             static_cast<std::int16_t>(std::clamp<std::int64_t>(r, -32768, 32767))));
+    }
+    // PSPRECOMP_SAS_DIAG: peak of each bus over ~1 s of grains.
+    static const bool bus_diag = std::getenv("PSPRECOMP_SAS_DIAG") != nullptr;
+    if (bus_diag) {
+        static std::int64_t dry_peak{}, wet_peak{}, input_peak{}, out_clipped{};
+        static std::uint64_t grains{};
+        for (std::uint32_t index = 0u; index < frames * 2u; ++index) {
+            dry_peak = std::max<std::int64_t>(dry_peak, std::abs(dry_mix[index]));
+            wet_peak = std::max<std::int64_t>(wet_peak, std::abs(wet_mix[index]));
+            const std::int64_t total = static_cast<std::int64_t>(dry_mix[index]) + wet_mix[index];
+            if (total > 32767 || total < -32768) ++out_clipped;
+        }
+        if (include_input) input_peak = std::max<std::int64_t>(input_peak, 1);
+        if (++grains % 172u == 0u) {
+            std::cerr << "[sas-bus] dry_peak=" << dry_peak << " wet_peak=" << wet_peak
+                      << " clipped_samples=" << out_clipped << " with_input=" << input_peak << "\n";
+            dry_peak = wet_peak = input_peak = out_clipped = 0;
+        }
     }
 }
 
@@ -3469,6 +3593,15 @@ void limit_frame_rate() {
 
     const auto target = wall_anchor + std::chrono::microseconds(virtual_time_us - guest_anchor);
     const auto now = std::chrono::steady_clock::now();
+    // A little late -- typically SDL_RenderPresent blocking on vsync for most
+    // of the frame -- is caught up by running the next frames without
+    // sleeping, keeping the anchor.  Jumping the guest clock here instead (by
+    // even a fraction of a millisecond, nearly every frame) made the SAS
+    // thread's 5.8 ms buffers start after the previous one had ended: 2108
+    // channel resyncs in 70 s of the boot screens, heard as a train of tiny
+    // dropouts until the main menu.  Only a real stall jumps the clock below.
+    constexpr auto kLateTolerance = std::chrono::milliseconds(100);
+    if (now >= target && now - target < kLateTolerance) return;
     if (now >= target) {
         // The selected rate is a ceiling, not a promise that this renderer can
         // finish inside the budget. When it misses, advance guest time by the
@@ -3765,8 +3898,22 @@ bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
                               << ge_state.transform.world[10] << ',' << ge_state.transform.world[11]
                               << " viewT=" << ge_state.transform.view[9] << ','
                               << ge_state.transform.view[10] << ',' << ge_state.transform.view[11]
-                              << " suspicious=" << suspicious
-                              << "\n";
+                              << " suspicious=" << suspicious;
+                    // Raw state words that decide the fragment colour: lighting
+                    // (0x17-0x1B, materials 0x53-0x58, ambient 0x5C/0x5D, light
+                    // colours 0x8F-0x9A), fog (0x1F, 0xCD-0xCF), texture function
+                    // and env colour (0xC9, 0xCA), blending (0x21, 0xDF-0xE1),
+                    // shade model (0x50).
+                    static constexpr std::uint8_t kStateWords[] = {
+                        0x17u, 0x18u, 0x19u, 0x1Au, 0x1Bu, 0x1Fu, 0x21u, 0x50u, 0x53u,
+                        0x54u, 0x55u, 0x56u, 0x57u, 0x58u, 0x5Cu, 0x5Du, 0x5Fu, 0x60u,
+                        0x8Fu, 0x90u, 0x92u, 0x93u, 0xC9u, 0xCAu, 0xCDu, 0xCEu, 0xCFu,
+                        0xDFu, 0xE0u, 0xE1u};
+                    std::cerr << " state=";
+                    for (const std::uint8_t word : kStateWords)
+                        std::cerr << std::hex << static_cast<unsigned>(word) << ':'
+                                  << (ge_state.commands[word] & 0x00FFFFFFu) << std::dec << ' ';
+                    std::cerr << "\n";
                     std::cerr.unsetf(std::ios::floatfield);
                 }
             }
@@ -6925,8 +7072,20 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         // PES6 renders through the software GE only: the guest framebuffer the
         // rasterizer filled is what the window shows.
-        ++software_presents;
-        display_window_present(rt.memory(), displayed);
+        //
+        // At most one present per virtual vblank period.  In several phases
+        // (boot screens, match start) two guest threads wait for vblank, so
+        // this runs twice per period; presenting both times drove SDL/Metal at
+        // ~110 presents/s and each present blocked until the compositor freed
+        // a drawable -- up to a whole refresh on a 60 Hz display.  The PSP
+        // only scans out once per period anyway.
+        static std::uint64_t last_present_tick = ~0ull;
+        const std::uint64_t present_tick = virtual_time_us / virtual_vblank_period_us();
+        if (present_tick != last_present_tick) {
+            last_present_tick = present_tick;
+            ++software_presents;
+            display_window_present(rt.memory(), displayed);
+        }
         if (frame_time_diag_enabled())
             frame_time_stats.present_time += std::chrono::steady_clock::now() - present_entry;
         limit_frame_rate();
@@ -7336,14 +7495,22 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             state.buffered_encoded_bytes = std::min(state.buffered_encoded_bytes, parsed.data_size);
             state.next_file_offset = std::min(read_size, parsed.file_size);
             state.write_offset = buffer_size == 0u ? 0u : read_size % buffer_size;
-            state.source_path = identify_atrac_source(header_bytes, parsed);
+            state.fully_loaded = read_size >= parsed.file_size ||
+                static_cast<std::uint64_t>(parsed.data_offset) + parsed.data_size <= read_size;
+            state.encoded_file_offset = parsed.data_offset;
+            if (!state.fully_loaded && read_size > parsed.data_offset)
+                atrac_append_stream(state, std::span<const std::uint8_t>(header_bytes).subspan(parsed.data_offset));
             if (std::getenv("PSPRECOMP_ATRAC_DIAG") != nullptr) {
                 std::cerr << "[atrac] set-halfway id=" << id
                           << " buffer=" << psprecomp::hex32(buffer)
                           << " read=" << read_size << " capacity=" << buffer_size
                           << " file=" << parsed.file_size << " frame=" << parsed.block_align
                           << " samples=" << parsed.total_samples
-                          << " source=\"" << state.source_path.string() << "\"\n";
+                          << " plus=" << parsed.atrac3plus << " channels=" << parsed.channels
+                          << " loop=" << parsed.loop_start << ".." << parsed.loop_end
+                          << " first_sample_offset=" << parsed.first_sample_offset
+                          << " data=" << parsed.data_offset << "+" << parsed.data_size
+                          << " fully_loaded=" << state.fully_loaded << "\n";
             }
             ctx.set_gpr(2, static_cast<std::uint32_t>(id));
         };
@@ -7394,6 +7561,16 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                     ctx.set_gpr(2, kAtracErrorBadAddress); return;
                 }
             }
+            // A looping stream is fed again from the frame holding the loop
+            // start once the file is exhausted, as the PSP library does; the
+            // decoder then finds the loop's frames right after the last ones.
+            if (state->next_file_offset >= state->header.file_size && state->loop_num != 0 &&
+                state->header.loop_start >= 0 && !state->fully_loaded) {
+                const std::uint64_t wrap = atrac_frame_file_offset(
+                    *state, static_cast<std::uint32_t>(state->header.loop_start));
+                state->next_file_offset = static_cast<std::uint32_t>(wrap);
+                state->encoded_wraps.push_back(wrap);
+            }
             const std::uint32_t remaining_file = state->next_file_offset < state->header.file_size ?
                 state->header.file_size - state->next_file_offset : 0u;
             const std::uint32_t free_bytes = state->buffer_size > state->buffered_encoded_bytes ?
@@ -7408,7 +7585,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         });
 
     runtime.register_hle("sceAtrac3plus", 0x7DB31251u,
-        [get_atrac](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+        [get_atrac](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
             auto *state = get_atrac(ctx.gpr[4]);
             if (!state) { ctx.set_gpr(2, kAtracErrorBadId); return; }
             const std::uint32_t bytes = ctx.gpr[5];
@@ -7417,6 +7594,14 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             if (bytes > state->last_writable_bytes) {
                 ctx.set_gpr(2, kAtracErrorIncorrectReadSize); return;
+            }
+            if (bytes != 0u && !state->fully_loaded) {
+                const std::uint32_t source = state->buffer_address + state->write_offset;
+                if (!rt.memory().contains(source, bytes)) { ctx.set_gpr(2, kAtracErrorBadAddress); return; }
+                static std::vector<std::uint8_t> chunk;
+                chunk.resize(bytes);
+                rt.memory().copy_out(source, chunk);
+                atrac_append_stream(*state, chunk);
             }
             state->buffered_encoded_bytes = std::min(state->buffer_size, state->buffered_encoded_bytes + bytes);
             state->next_file_offset = std::min(state->header.file_size, state->next_file_offset + bytes);
@@ -7444,61 +7629,39 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             if (output != 0u && !rt.memory().contains(output, max_bytes)) {
                 ctx.set_gpr(2, kAtracErrorBadAddress); return;
             }
-            // VCS failed here when no loose .AT3 matched the guest buffer.
-            // PES6 keeps its audio inside .afs archives, so decoding must not
-            // depend on a source file: read_atrac_pcm falls back to silence.
             auto restart_for_loop = [&]() -> bool {
                 if (state->loop_num == 0) return false;
-                // A stream with no loop region must not be restarted. The line
-                // below fell back to sample 0 when loop_start was negative, so a
-                // clip that simply ended -- a radio news bulletin -- was played
-                // again from the top instead of finishing and handing the
-                // station back to the music. loop_num survives in a reused
-                // context, so the bulletin inherited the music's loop.
-                if (state->header.loop_start < 0) {
-                    if (std::getenv("PSPRECOMP_ATRAC_DIAG") != nullptr)
-                        std::cerr << "[atrac] fim de stream sem regiao de loop: "
-                                  << state->source_path.filename().string()
-                                  << " (loop_num=" << state->loop_num
-                                  << " ignorado)\n";
-                    return false;
-                }
+                // A stream with no loop region must not be restarted: a clip
+                // that simply ended would otherwise play again from the top.
+                // loop_num survives in a reused context.
+                if (state->header.loop_start < 0) return false;
                 if (state->loop_num > 0) --state->loop_num;
-                state->sample_position = state->header.loop_start >= 0 ?
-                    static_cast<std::uint32_t>(state->header.loop_start) : 0u;
-                close_atrac_decoder(*state);
-                return open_atrac_decoder(*state);
+                // The decoder is not reset: a streamed loop continues with the
+                // frames the game feeds from the loop start, a fully loaded one
+                // re-primes itself on the backward seek.
+                state->sample_position = atrac_loop_start(*state);
+                if (std::getenv("PSPRECOMP_ATRAC_DIAG") != nullptr)
+                    std::cerr << "[atrac] loop id=" << ctx.gpr[4] << " to sample "
+                              << state->sample_position << " loop_num=" << state->loop_num << "\n";
+                return true;
             };
-            if (state->sample_position >= state->header.total_samples && !restart_for_loop()) {
+            if (state->sample_position >= atrac_stream_end(*state) && !restart_for_loop()) {
                 if (samples_addr != 0u) rt.memory().store32(samples_addr, 0u);
                 if (finish_addr != 0u) rt.memory().store32(finish_addr, 1u);
                 if (remain_addr != 0u) rt.memory().store32(remain_addr, 0u);
                 set_success(ctx);
                 return;
             }
-            const std::uint32_t requested_samples = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                max_samples, state->header.total_samples - state->sample_position));
-            // Reused across calls. This was a fresh std::vector every
-            // sceAtracDecodeData -- allocate, zero a few kilobytes, decode into
-            // it, free -- on the hottest audio import there is, and the radio
-            // runs two of these at once whenever a news bulletin plays over the
-            // music. The buffer only ever grows, and only one guest audio thread
-            // reaches this import at a time.
-            static std::vector<std::uint8_t> pcm;
-            const std::size_t pcm_bytes =
-                static_cast<std::size_t>(requested_samples) * kAtracOutputChannels * 2u;
-            if (pcm.size() < pcm_bytes) pcm.resize(pcm_bytes);
-            const std::span<std::uint8_t> pcm_span(pcm.data(), pcm_bytes);
+            // Reused across calls: this is the hottest audio import.
+            static std::vector<std::int16_t> pcm;
+            pcm.resize(static_cast<std::size_t>(max_samples) * kAtracOutputChannels);
             static const bool audio_summary_enabled = [] {
                 const char *text = std::getenv("PSPRECOMP_AUDIO_SUMMARY");
                 return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
             }();
             const auto decode_started = audio_summary_enabled
                 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            std::size_t got = read_atrac_pcm(*state, pcm_span);
-            if (got == 0u && restart_for_loop()) {
-                got = read_atrac_pcm(*state, pcm_span);
-            }
+            const std::uint32_t decoded = decode_atrac_frame(rt, *state, pcm);
             if (audio_summary_enabled) {
                 static std::uint64_t decode_calls = 0u;
                 static std::uint64_t decode_total_ns = 0u;
@@ -7515,17 +7678,26 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                               << " max_us=" << decode_max_ns / 1000u << "\n";
                 }
             }
-            const std::size_t bytes_per_sample = static_cast<std::size_t>(kAtracOutputChannels) * 2u;
-            const std::uint32_t samples = static_cast<std::uint32_t>(got / bytes_per_sample);
-            got = static_cast<std::size_t>(samples) * bytes_per_sample;
-            if (output != 0u && got != 0u) rt.memory().copy_in(output, std::span<const std::uint8_t>(pcm.data(), got));
+            // The last frame of a stream (or loop) only yields what is left.
+            const std::uint64_t stream_end = atrac_stream_end(*state);
+            const auto samples = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                decoded, stream_end - state->sample_position));
+            if (output != 0u && samples != 0u) {
+                for (std::size_t index = 0u; index < static_cast<std::size_t>(samples) * kAtracOutputChannels; ++index)
+                    rt.memory().store16(output + static_cast<std::uint32_t>(index * 2u),
+                                        static_cast<std::uint16_t>(pcm[index]));
+            }
             state->sample_position += samples;
-            if (state->buffered_encoded_bytes >= state->header.block_align)
-                state->buffered_encoded_bytes -= state->header.block_align;
-            else
-                state->buffered_encoded_bytes = 0u;
+            if (state->fully_loaded) {
+                if (state->buffered_encoded_bytes >= state->header.block_align)
+                    state->buffered_encoded_bytes -= state->header.block_align;
+                else
+                    state->buffered_encoded_bytes = 0u;
+            } else {
+                state->buffered_encoded_bytes = std::min(state->buffer_size, atrac_streamed_bytes(*state));
+            }
             const bool finished = samples == 0u ||
-                (state->sample_position >= state->header.total_samples && state->loop_num == 0);
+                (state->sample_position >= stream_end && state->loop_num == 0);
             const std::uint32_t remaining_frames = state->header.block_align == 0u ? 0u :
                 state->buffered_encoded_bytes / state->header.block_align;
             if (samples_addr != 0u) rt.memory().store32(samples_addr, samples);
@@ -7626,9 +7798,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             const std::uint32_t sample = ctx.gpr[5];
             const std::uint32_t info = ctx.gpr[6];
             if (!rt.memory().contains(info, 32u)) { ctx.set_gpr(2, kAtracErrorBadAddress); return; }
-            const std::uint32_t frame = sample / atrac_samples_per_frame(*state);
-            const std::uint64_t pos64 = static_cast<std::uint64_t>(state->header.data_offset) +
-                static_cast<std::uint64_t>(frame) * state->header.block_align;
+            const std::uint64_t pos64 = atrac_frame_file_offset(*state, atrac_decoder_sample(*state, sample));
             const std::uint32_t file_pos = static_cast<std::uint32_t>(std::min<std::uint64_t>(pos64, state->header.file_size));
             const std::uint32_t writable = std::min(state->buffer_size, state->header.file_size - file_pos);
             rt.memory().store32(info + 0u, state->buffer_address);
@@ -7640,19 +7810,30 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         });
 
     runtime.register_hle("sceAtrac3plus", 0x644E5607u,
-        [get_atrac](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+        [get_atrac](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
             auto *state = get_atrac(ctx.gpr[4]);
             if (!state) { ctx.set_gpr(2, kAtracErrorBadId); return; }
             const std::uint32_t sample = std::min(ctx.gpr[5], state->header.total_samples);
             const std::uint32_t bytes_first = ctx.gpr[6];
-            const std::uint32_t frame = sample / atrac_samples_per_frame(*state);
-            const std::uint64_t pos64 = static_cast<std::uint64_t>(state->header.data_offset) +
-                static_cast<std::uint64_t>(frame) * state->header.block_align;
+            const std::uint64_t pos64 = atrac_frame_file_offset(*state, atrac_decoder_sample(*state, sample));
             state->sample_position = sample;
             state->next_file_offset = static_cast<std::uint32_t>(std::min<std::uint64_t>(pos64 + bytes_first, state->header.file_size));
             state->buffered_encoded_bytes = std::min(bytes_first, state->buffer_size);
             state->write_offset = state->buffer_size == 0u ? 0u : bytes_first % state->buffer_size;
-            close_atrac_decoder(*state);
+            // sceAtracGetBufferInfoForResetting pointed the game at the start
+            // of the buffer; what it wrote there is the stream from that frame.
+            state->encoded.clear();
+            state->encoded_read = 0u;
+            state->encoded_file_offset = pos64;
+            state->encoded_wraps.clear();
+            if (!state->fully_loaded && bytes_first != 0u) {
+                const std::uint32_t copy = std::min(bytes_first, state->buffer_size);
+                if (!rt.memory().contains(state->buffer_address, copy)) { ctx.set_gpr(2, kAtracErrorBadAddress); return; }
+                state->encoded.resize(copy);
+                rt.memory().copy_out(state->buffer_address, state->encoded);
+            }
+            state->decoder.reset();
+            state->decoder_next_frame = (pos64 - state->header.data_offset) / state->header.block_align;
             set_success(ctx);
         });
 

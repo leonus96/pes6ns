@@ -14,6 +14,7 @@
 #include <SDL.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -93,13 +94,34 @@ void present_rgba(const void *pixels, int width, int height, int pitch) {
         g.texture_height = height;
         SDL_RenderSetLogicalSize(g.renderer, width, height);
     }
+    // PSPRECOMP_PRESENT_DIAG: where the present time goes, every 120 frames.
+    static const bool diag = std::getenv("PSPRECOMP_PRESENT_DIAG") != nullptr;
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
     SDL_UpdateTexture(g.texture, nullptr, pixels, pitch);
     SDL_SetRenderDrawColor(g.renderer, 0, 0, 0, 255);
     SDL_RenderClear(g.renderer);
     SDL_RenderCopy(g.renderer, g.texture, nullptr, nullptr);
+    const auto t1 = clock::now();
     SDL_RenderPresent(g.renderer);
+    const auto t2 = clock::now();
     ++g.presented;
     pump_events();
+    if (diag) {
+        static std::chrono::nanoseconds upload{}, present{}, events{}, present_max{};
+        const auto t3 = clock::now();
+        upload += t1 - t0;
+        present += t2 - t1;
+        events += t3 - t2;
+        present_max = std::max<std::chrono::nanoseconds>(present_max, t2 - t1);
+        if (g.presented % 120u == 0u) {
+            const auto us = [](std::chrono::nanoseconds ns) { return ns.count() / 120000; };
+            std::cerr << "[present-diag] frames=" << g.presented << " upload_us=" << us(upload)
+                      << " render_present_us=" << us(present) << " events_us=" << us(events)
+                      << " present_max_us=" << present_max.count() / 1000 << "\n";
+            upload = present = events = present_max = {};
+        }
+    }
 }
 
 std::uint32_t keyboard_buttons() {
@@ -167,12 +189,23 @@ void display_window_start() {
         scale = std::clamp(std::atoi(text), 1, 8);
     g.window = SDL_CreateWindow("PES6 Native", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                 480 * scale, 272 * scale, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
-    if (g.window != nullptr) g.renderer = SDL_CreateRenderer(g.window, -1, SDL_RENDERER_ACCELERATED);
+    // No vsync by default: the HLE frame limiter already paces presents at the
+    // PSP's 59.94 Hz, and a present that also waits for the display (the Metal
+    // renderer did, without asking: up to a full 60 Hz refresh per frame)
+    // pushes every frame past its slot, so the boot screens ran at 75-87 %
+    // speed and the audio starved.  PES6_VSYNC=1 restores it.
+    const char *vsync_text = std::getenv("PES6_VSYNC");
+    const bool vsync = vsync_text != nullptr && *vsync_text != '\0' && std::string(vsync_text) != "0";
+    SDL_SetHint(SDL_HINT_RENDER_VSYNC, vsync ? "1" : "0");
+    if (g.window != nullptr)
+        g.renderer = SDL_CreateRenderer(g.window, -1,
+                                        SDL_RENDERER_ACCELERATED | (vsync ? SDL_RENDERER_PRESENTVSYNC : 0u));
     if (g.window == nullptr || g.renderer == nullptr) {
         std::cerr << "[window] could not create window/renderer: " << SDL_GetError() << " (continuing headless)\n";
         display_window_shutdown();
         return;
     }
+    SDL_RenderSetVSync(g.renderer, vsync ? 1 : 0);
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
     g.enabled = true;
     open_first_controller();

@@ -393,13 +393,11 @@ public:
         range_first_ = first;
         rows_per_chunk_ = rows / static_cast<std::int32_t>(chunks);
         remainder_ = rows % static_cast<std::int32_t>(chunks);
-        chunk_count_ = chunks;
-        active_participants_ = participants;
-        next_chunk_.store(0u, std::memory_order_relaxed);
-        pending_.store(participants - 1u, std::memory_order_relaxed);
-
-        // Publishing a new generation releases the callback and range fields.
-        // Workers acquire that generation before touching any of them.
+        done_.store(0u, std::memory_order_relaxed);
+        // Publishing the batch word releases the callback and range fields; a
+        // worker acquires it with the compare-exchange that claims a chunk.
+        ++batch_;
+        work_.store(pack_work(batch_, participants, chunks, 0u), std::memory_order_release);
         generation_.fetch_add(1u, std::memory_order_release);
         if (parked_.load(std::memory_order_acquire) != 0u)
             generation_.notify_all();
@@ -410,7 +408,9 @@ public:
         // cannot make progress until every row is done, so parking it in the
         // kernel only adds wake latency. PAUSE keeps this join entirely in user
         // space without the scheduler storm caused by sched_yield.
-        while (pending_.load(std::memory_order_acquire) != 0u)
+        // Waiting on finished chunks rather than on participants: a worker that
+        // woke up late can never be counted against a batch it did not run.
+        while (done_.load(std::memory_order_acquire) != chunks)
             raster_cpu_relax();
         body_invoke_ = nullptr;
         body_context_ = nullptr;
@@ -464,11 +464,33 @@ private:
         body_invoke_(body_context_, participant, begin, begin + count - 1);
     }
 
+    // Batch word: next chunk (bits 0-19), chunk count (20-39), participants
+    // (40-45) and batch number (46-63).  Everything a worker needs to decide
+    // whether it may claim a chunk lives in the word it claims it with, so a
+    // worker still looking at an old batch can never take part in a new one
+    // with stale limits.  The caller only rewrites the callback and the range
+    // fields after every chunk of the batch has finished, so a claimed chunk
+    // always runs with its own batch's fields.
+    static constexpr std::uint64_t kWorkFieldMask = (1ull << 20u) - 1u;
+
+    static std::uint64_t pack_work(std::uint64_t batch, unsigned participants,
+                                   unsigned chunks, unsigned next) noexcept {
+        return (batch << 46u) | (static_cast<std::uint64_t>(participants & 63u) << 40u) |
+               (static_cast<std::uint64_t>(chunks) << 20u) | next;
+    }
+
     void run_available_chunks(unsigned participant) {
+        std::uint64_t work = work_.load(std::memory_order_acquire);
         for (;;) {
-            const unsigned chunk = next_chunk_.fetch_add(1u, std::memory_order_relaxed);
-            if (chunk >= chunk_count_) return;
-            run_chunk(chunk, participant);
+            const auto next = static_cast<unsigned>(work & kWorkFieldMask);
+            const auto chunks = static_cast<unsigned>((work >> 20u) & kWorkFieldMask);
+            const auto participants = static_cast<unsigned>((work >> 40u) & 63u);
+            if (participant >= participants || next >= chunks) return;
+            if (!work_.compare_exchange_weak(work, work + 1u, std::memory_order_acq_rel,
+                                             std::memory_order_acquire)) continue;
+            run_chunk(next, participant);
+            done_.fetch_add(1u, std::memory_order_release);
+            work = work_.load(std::memory_order_acquire);
         }
     }
 
@@ -495,11 +517,7 @@ private:
 
             // More chunks than participants balance triangular scanline work:
             // middle rows often contain far more covered pixels than edge rows.
-            if (worker_index < active_participants_) {
-                run_available_chunks(worker_index);
-                if (pending_.fetch_sub(1u, std::memory_order_acq_rel) == 1u)
-                    pending_.notify_one();
-            }
+            run_available_chunks(worker_index);
         }
     }
 
@@ -511,11 +529,10 @@ private:
     std::vector<std::thread> workers_;
     void *body_context_{};
     BodyInvoke body_invoke_{};
-    std::atomic<unsigned> next_chunk_{};
-    std::atomic<unsigned> pending_{};
+    std::atomic<std::uint64_t> work_{};
+    std::atomic<unsigned> done_{};
     std::atomic<unsigned> parked_{};
-    unsigned chunk_count_{};
-    unsigned active_participants_{};
+    std::uint64_t batch_{};
     std::int32_t range_first_{};
     std::int32_t rows_per_chunk_{};
     std::int32_t remainder_{};
@@ -2592,6 +2609,10 @@ struct FragmentSetup {
     Color texture_env{};
     bool texture_use_alpha{};
     bool texture_double_color{};
+    // Fog (FGE, FCOL): mixes the textured colour towards fog_color by the
+    // interpolated per-vertex coefficient before alpha test and blending.
+    bool fog_enabled{};
+    Color fog_color{};
 };
 
 
@@ -2663,6 +2684,9 @@ FragmentSetup make_fragment_setup(const std::array<std::uint32_t, 256> &commands
     setup.texture_double_color = (texfunc & 0x10000u) != 0u;
     setup.texture_env = unpack32(data24(commands[0xCAu]) | 0xFF000000u);
 
+    setup.fog_enabled = !setup.clear_mode && (data24(commands[0x1Fu]) & 1u) != 0u;
+    setup.fog_color = unpack32(data24(commands[0xCFu]) | 0xFF000000u);
+
     setup.valid = true;
     return setup;
 }
@@ -2671,10 +2695,10 @@ FragmentSetup make_fragment_setup_cached(const std::array<std::uint32_t, 256> &c
     // Only registers consumed by make_fragment_setup participate. Most city
     // draws repeat this state for long runs, so avoid decoding it again until a
     // relevant register actually changes.
-    constexpr std::size_t kRegCount = 23u;
+    constexpr std::size_t kRegCount = 25u;
     constexpr std::array<std::uint8_t, kRegCount> regs{{
         0x9D,0xD2,0x9C,0xD4,0xD5,0xD3,0x1E,0xE8,0xE9,0x9F,0x9E,0x23,
-        0xDE,0xE7,0xDF,0x21,0xE0,0xE1,0xDB,0x22,0xC9,0xCA,0x00}};
+        0xDE,0xE7,0xDF,0x21,0xE0,0xE1,0xDB,0x22,0xC9,0xCA,0x1F,0xCF,0x00}};
     struct Cache {
         std::array<std::uint32_t, kRegCount> values{};
         FragmentSetup setup{};
@@ -2745,6 +2769,18 @@ Color apply_texture_function(Color vertex, Color texture, const FragmentSetup &s
         out.b = static_cast<std::uint8_t>(std::min(255u, static_cast<unsigned>(out.b) * 2u));
     }
     return out;
+}
+
+// fog = 1 keeps the colour, 0 replaces RGB with the fog colour; alpha is kept.
+Color apply_fog(Color source, float fog, const FragmentSetup &setup) noexcept {
+    if (!setup.fog_enabled || !(fog < 1.0f)) return source;
+    const float f = std::max(fog, 0.0f);
+    const auto mix = [f](std::uint8_t colour, std::uint8_t fog_colour) {
+        return round_clamp_to_byte(static_cast<float>(fog_colour) +
+                                   (static_cast<float>(colour) - static_cast<float>(fog_colour)) * f);
+    };
+    return {mix(source.r, setup.fog_color.r), mix(source.g, setup.fog_color.g),
+            mix(source.b, setup.fog_color.b), source.a};
 }
 
 bool compare_value(std::uint32_t function, std::uint32_t left, std::uint32_t right) noexcept {
@@ -3023,6 +3059,8 @@ void rasterize_rectangle(psprecomp::GuestMemory &memory,
                 const float v = (a.v + (b.v - a.v) * ty) / q;
                 source = apply_texture_function(source, sample_texture(memory, setup.texture, u, v), setup);
             }
+            // A sprite takes its fog, like its colour, from the second vertex.
+            source = apply_fog(source, b.fog_factor, setup);
             if (!clear_mode && !alpha_test(source, setup)) { ++row_stats.pixels_alpha_rejected; continue; }
             const float zf = static_cast<float>(a.z) + (static_cast<float>(b.z) - a.z) * ((tx + ty) * 0.5f);
             const std::uint16_t z = depth_from_float(zf);
@@ -3252,7 +3290,8 @@ bool write_fragment(psprecomp::GuestMemory &memory,
                     [[maybe_unused]] const std::array<std::uint32_t, 256> &commands,
                     const FragmentSetup &setup,
                     std::int32_t x, std::int32_t y, float zf, float u, float v,
-                    Color source, GeRenderStats &stats, bool depth_resolved = false) {
+                    Color source, GeRenderStats &stats, bool depth_resolved = false,
+                    float fog = 1.0f) {
     if (!depth_resolved) {
         if (!setup.valid || x < 0 || y < 0 ||
             x >= static_cast<std::int32_t>(setup.framebuffer_stride)) {
@@ -3278,6 +3317,7 @@ bool write_fragment(psprecomp::GuestMemory &memory,
 
     if (setup.texture_enabled && !setup.clear_mode)
         source = apply_texture_function(source, sample_texture(memory, setup.texture, u, v), setup);
+    source = apply_fog(source, fog, setup);
     if (!setup.clear_mode && !alpha_test(source, setup)) { ++stats.pixels_alpha_rejected; return false; }
     if (!depth_before_shading &&
         !depth_test_and_write(memory, setup, x, y, z, setup.clear_mode && setup.clear_depth)) {
@@ -3746,8 +3786,13 @@ void rasterize_prepared_triangle_rows(psprecomp::GuestMemory &memory,
             const Color color = triangle.flat_shading
                 ? triangle.provoking_color
                 : perspective_color(a, b, c, l0, l1, l2, denominator);
+            // Perspective-correct, like the other varyings.
+            const float fog = setup.fog_enabled
+                ? (l0 * a.fog_factor * a.inv_w + l1 * b.fog_factor * b.inv_w +
+                   l2 * c.fog_factor * c.inv_w) / denominator
+                : 1.0f;
             write_fragment(memory, commands, setup, x, y, z, u, v, color,
-                           row_stats, triangle.early_depth);
+                           row_stats, triangle.early_depth, fog);
         }
     }
 }
@@ -3846,7 +3891,7 @@ void rasterize_point(psprecomp::GuestMemory &memory,
     const float q = texture_enabled ? vertex.q : 1.0f;
     write_fragment(memory, commands, setup, static_cast<std::int32_t>(std::floor(vertex.x)),
                    static_cast<std::int32_t>(std::floor(vertex.y)), vertex.z,
-                   vertex.u / q, vertex.v / q, vertex.color, stats);
+                   vertex.u / q, vertex.v / q, vertex.color, stats, false, vertex.fog_factor);
 }
 
 void rasterize_line(psprecomp::GuestMemory &memory,
@@ -3891,7 +3936,8 @@ void rasterize_line(psprecomp::GuestMemory &memory,
         write_fragment(memory, commands, line_setup,
                        static_cast<std::int32_t>(std::floor(a.x + dx * t)),
                        static_cast<std::int32_t>(std::floor(a.y + dy * t)),
-                       a.z + (b.z - a.z) * t, u, v, color, stats);
+                       a.z + (b.z - a.z) * t, u, v, color, stats, false,
+                       (one_minus_t * a.fog_factor * a.inv_w + t * b.fog_factor * b.inv_w) / denominator);
     }
 }
 
