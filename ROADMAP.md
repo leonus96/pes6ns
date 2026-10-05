@@ -101,7 +101,7 @@ Cada fase tiene **tareas**, **criterio de terminado (DoD)** y **estimación** pa
 - [ ] Leer `docs/PROFILE_GUIDE.md`, `docs/SOURCE_PROVENANCE.md` y recorrer `profiles/vcs/host` para entender: bootstrap, `Runtime::register_hle()`, `register_function()`, `register_native_fast_path()`, backend GE por software.
 - [ ] Documentar en `progress/` un mapa de cómo fluye un frame en el perfil VCS (display list GE → rasterizador CPU → presentación).
 
-- [ ] (Extra) `switch/selftest`: `.nro` que corre los tests del framework en la consola (`PSPRECOMP_TESTS_NO_SUBPROCESS` omite los 7 tests que lanzan `psp_recomp`). Compila; falta probarlo en la Switch.
+- [x] (Extra) `switch/selftest`: `.nro` que corre los tests del framework en la consola (`PSPRECOMP_TESTS_NO_SUBPROCESS` omite los 7 tests que lanzan `psp_recomp`). **PASS en la consola (113 ms)** tras corregir `Runtime::set_game_root` para rutas `sdmc:`.
 
 **DoD:** framework compila y pasa tests en macOS; existe una nota que explica la arquitectura del perfil VCS.
 
