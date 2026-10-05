@@ -7,11 +7,13 @@
 # kick-offs and goal kicks, START leaves the replay viewer the game opens after
 # every goal (it waits for "START Final"), and in open play START only pauses
 # with "Volver al partido" selected, which the second ✕ confirms.
-# Note: it deletes profiles/pes6/game/PSP/SAVEDATA (first-boot dialogs expected).
+# Saves go to a scratch folder that is emptied on every run (first-boot dialogs
+# expected), never to the player's profiles/pes6/game/PSP/SAVEDATA.
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/../../.." && pwd)"
 stop="${1:-48000}"
-rm -rf "$repo/profiles/pes6/game/PSP/SAVEDATA"
+export PES6_SAVEDATA_DIR="$repo/out/pes6/route-savedata"
+rm -rf "$PES6_SAVEDATA_DIR"
 
 # Language, option file and level dialogs, menus, team and kit selection.
 route="0x4000@300 0x4000@1000 0x4000@1700 0x4000@2400 0x4000@3100 0x4000@3800 0x4000@4500 0x4000@5200"

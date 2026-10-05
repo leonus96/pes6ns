@@ -14,6 +14,7 @@
 #include "framebuffer_capture.hpp"
 #include "ge_renderer.hpp"
 #include "ge_gpu_backend.hpp"
+#include "param_sfo.hpp"
 
 #include "psprecomp/common.hpp"
 
@@ -2381,10 +2382,77 @@ bool write_savedata_auxiliary(psprecomp::Runtime &runtime, std::uint32_t paramet
     return write_guest_file(runtime, savedata_directory(runtime, parameter_address) / filename, buffer, actual_size);
 }
 
+// sfoParam inside the savedata parameter block: title, savedata title and
+// detail strings, then the parental level byte.
+constexpr std::uint32_t kSavedataSfoTitleOffset = 0x80u;
+constexpr std::uint32_t kSavedataSfoSavedataTitleOffset = 0x100u;
+constexpr std::uint32_t kSavedataSfoDetailOffset = 0x180u;
+constexpr std::uint32_t kSavedataSfoParentalLevelOffset = 0x580u;
+constexpr std::uint32_t kSfoFileListSize = 3168u;  // 99 entries of name[13] + hash[16] + pad[3]
+constexpr std::uint32_t kSfoSavedataParamsSize = 128u;
+
+// Our saves are plaintext.  The PARAM.SFO mirrors the one the PSP writes, with
+// SAVEDATA_PARAMS all zero and no file hashes, which is how PPSSPP marks an
+// unencrypted save (so it can load ours too).
+bool write_savedata_sfo(psprecomp::Runtime &runtime, std::uint32_t parameter_address,
+                        const std::filesystem::path &data_path) {
+    const auto &memory = runtime.memory();
+    const auto directory = data_path.parent_path();
+    ParamSfo sfo;
+    sfo.set_string("CATEGORY", "MS", 4u);
+    sfo.set_int("PARENTAL_LEVEL", memory.load8(parameter_address + kSavedataSfoParentalLevelOffset));
+    sfo.set_string("SAVEDATA_DETAIL", read_fixed_string(memory, parameter_address + kSavedataSfoDetailOffset, 0x400u), 0x400u);
+    sfo.set_string("SAVEDATA_DIRECTORY", directory.filename().string(), 64u);
+    sfo.set_string("SAVEDATA_TITLE", read_fixed_string(memory, parameter_address + kSavedataSfoSavedataTitleOffset, 0x80u), 0x80u);
+    sfo.set_string("TITLE", read_fixed_string(memory, parameter_address + kSavedataSfoTitleOffset, 0x80u), 0x80u);
+    std::vector<std::uint8_t> file_list(kSfoFileListSize, 0u);
+    const std::string file_name = data_path.filename().string();
+    std::copy_n(file_name.begin(), std::min<std::size_t>(file_name.size(), 12u), file_list.begin());
+    sfo.set_bytes("SAVEDATA_FILE_LIST", std::move(file_list), kSfoFileListSize);
+    sfo.set_bytes("SAVEDATA_PARAMS", std::vector<std::uint8_t>(kSfoSavedataParamsSize, 0u), kSfoSavedataParamsSize);
+    return sfo.write_file(directory / "PARAM.SFO");
+}
+
+bool savedata_is_encrypted(const std::filesystem::path &directory) {
+    const auto sfo = ParamSfo::read_file(directory / "PARAM.SFO");
+    if (!sfo) return false;
+    const auto *params = sfo->get_bytes("SAVEDATA_PARAMS");
+    return params != nullptr && !params->empty() && (*params)[0] != 0u;
+}
+
+void store_fixed_string(psprecomp::GuestMemory &memory, std::uint32_t address, std::size_t size, const std::string &text) {
+    memory.zero(address, size);
+    std::vector<std::uint8_t> bytes(text.begin(), text.end());
+    if (bytes.size() >= size) bytes.resize(size - 1u);
+    if (!bytes.empty()) memory.copy_in(address, bytes);
+}
+
+// A load hands the save's PARAM.SFO strings back in sfoParam.
+void load_savedata_sfo_param(psprecomp::Runtime &runtime, std::uint32_t parameter_address,
+                             const std::filesystem::path &directory) {
+    const auto sfo = ParamSfo::read_file(directory / "PARAM.SFO");
+    if (!sfo) return;
+    auto &memory = runtime.memory();
+    if (const auto title = sfo->get_string("TITLE"))
+        store_fixed_string(memory, parameter_address + kSavedataSfoTitleOffset, 0x80u, *title);
+    if (const auto title = sfo->get_string("SAVEDATA_TITLE"))
+        store_fixed_string(memory, parameter_address + kSavedataSfoSavedataTitleOffset, 0x80u, *title);
+    if (const auto detail = sfo->get_string("SAVEDATA_DETAIL"))
+        store_fixed_string(memory, parameter_address + kSavedataSfoDetailOffset, 0x400u, *detail);
+    if (const auto level = sfo->get_int("PARENTAL_LEVEL"))
+        memory.store8(parameter_address + kSavedataSfoParentalLevelOffset, static_cast<std::uint8_t>(*level));
+}
+
 std::uint32_t load_savedata_file(psprecomp::Runtime &runtime, std::uint32_t parameter_address,
                                  const std::filesystem::path &path, bool raw_mode) {
     if (!std::filesystem::is_regular_file(path)) {
         return raw_mode ? 0x80110329u : 0x80110307u;
+    }
+    if (!raw_mode && savedata_is_encrypted(path.parent_path())) {
+        // Saves from a PSP or from PPSSPP: DATA.BIN is ciphertext.  Importing
+        // them would need the PSP savedata crypto, which is not implemented.
+        runtime_log_line("[savedata] " + path.parent_path().string() + " is encrypted (unsupported); reporting broken data");
+        return 0x80110306u;
     }
     std::ifstream input(path, std::ios::binary | std::ios::ate);
     if (!input) return raw_mode ? 0x80110329u : 0x80110305u;
@@ -2403,6 +2471,7 @@ std::uint32_t load_savedata_file(psprecomp::Runtime &runtime, std::uint32_t para
     if (!input && !bytes.empty()) return 0x80110305u;
     if (!bytes.empty()) runtime.memory().copy_in(destination, bytes);
     runtime.memory().store32(parameter_address + kSavedataDataSizeOffset, static_cast<std::uint32_t>(bytes.size()));
+    if (!raw_mode) load_savedata_sfo_param(runtime, parameter_address, path.parent_path());
     return 0u;
 }
 
@@ -2414,12 +2483,28 @@ std::uint32_t save_savedata_file(psprecomp::Runtime &runtime, std::uint32_t para
     if (size > capacity || (size != 0u && (source == 0u || !runtime.memory().contains(source, size)))) {
         return raw_mode ? 0x80110328u : 0x80110388u;
     }
+    if (!raw_mode && savedata_is_encrypted(path.parent_path())) {
+        // Keep an encrypted save (copied from a PSP or PPSSPP) instead of
+        // overwriting it with ours: it cannot be read here, but it is the
+        // player's data.
+        std::filesystem::path backup;
+        for (int index = 1; backup.empty() || std::filesystem::exists(backup); ++index) {
+            backup = path.parent_path();
+            backup += ".encrypted-backup" + (index == 1 ? std::string{} : std::to_string(index));
+        }
+        std::error_code error;
+        std::filesystem::rename(path.parent_path(), backup, error);
+        runtime_log_line("[savedata] encrypted save moved to " + backup.string() +
+                         (error ? " (failed: " + error.message() + ")" : ""));
+        if (error) return 0x80110385u;
+    }
     if (!write_guest_file(runtime, path, source, size)) return raw_mode ? 0x80110329u : 0x80110385u;
     if (!raw_mode) {
         if (!write_savedata_auxiliary(runtime, parameter_address, kSavedataIcon0Offset, "ICON0.PNG") ||
             !write_savedata_auxiliary(runtime, parameter_address, kSavedataIcon1Offset, "ICON1.PMF") ||
             !write_savedata_auxiliary(runtime, parameter_address, kSavedataPic1Offset, "PIC1.PNG") ||
-            !write_savedata_auxiliary(runtime, parameter_address, kSavedataSnd0Offset, "SND0.AT3")) {
+            !write_savedata_auxiliary(runtime, parameter_address, kSavedataSnd0Offset, "SND0.AT3") ||
+            !write_savedata_sfo(runtime, parameter_address, path)) {
             return 0x80110385u;
         }
     }
@@ -2442,7 +2527,8 @@ std::uint32_t list_savedata_directories(psprecomp::Runtime &runtime, std::uint32
         for (const auto &entry : std::filesystem::directory_iterator(root)) {
             if (!entry.is_directory()) continue;
             const std::string directory_name = entry.path().filename().string();
-            if (!directory_name.starts_with(game)) continue;
+            // Skip foreign folders and our ".encrypted-backup" copies.
+            if (!directory_name.starts_with(game) || directory_name.find('.') != std::string::npos) continue;
             names.push_back(directory_name.substr(game.size()));
         }
     }
@@ -2531,21 +2617,125 @@ std::uint32_t query_savedata_sizes(psprecomp::Runtime &runtime, std::uint32_t pa
     return 0u;
 }
 
+// LISTLOAD/LISTSAVE normally open the system dialog with the game's
+// saveNameList and let the player pick an entry; the chosen name is written
+// back to saveName.  There is no dialog here, so the entry is picked
+// automatically:
+//  - LISTLOAD follows the cursor the game asks for (focus): latest, oldest,
+//    first or last existing save.  Without any save the dialog would only say
+//    "no data", reported as 0x80110307.
+//  - LISTSAVE overwrites the most recent existing save in the list, as a player
+//    with a single career would; with none it takes the focused empty slot.
+// TODO: an in-game picker (Fase 7 overlay) for players with several saves.
+std::vector<std::string> savedata_name_list(const psprecomp::GuestMemory &memory, std::uint32_t parameter_address) {
+    std::vector<std::string> names;
+    const std::uint32_t list = memory.load32(parameter_address + 0x60u);
+    if (list == 0u) return names;
+    for (std::uint32_t index = 0u; index < 1024u && memory.contains(list + index * 20u, 20u); ++index) {
+        std::string name = safe_savedata_component(read_fixed_string(memory, list + index * 20u, 20u));
+        if (name.empty()) break;
+        names.push_back(std::move(name));
+    }
+    return names;
+}
+
+std::optional<std::string> choose_savedata_list_entry(psprecomp::Runtime &runtime, std::uint32_t parameter_address,
+                                                      const std::string &file_name, bool saving) {
+    enum Focus : std::uint32_t { FirstList = 1u, LastList = 2u, Latest = 3u, Oldest = 4u, FirstEmpty = 7u, LastEmpty = 8u };
+    const auto names = savedata_name_list(runtime.memory(), parameter_address);
+    if (names.empty()) return std::nullopt;
+    const std::string game = safe_savedata_component(read_fixed_string(
+        runtime.memory(), parameter_address + kSavedataGameNameOffset, 13u));
+    const auto root = savedata_root(runtime);
+    struct Existing {
+        std::string name;
+        std::filesystem::file_time_type time;
+    };
+    std::vector<Existing> existing;
+    std::vector<std::string> empty;
+    for (const auto &name : names) {
+        std::error_code error;
+        const auto path = root / (game + name) / file_name;
+        const auto time = std::filesystem::last_write_time(path, error);
+        if (!error && std::filesystem::is_regular_file(path, error)) existing.push_back({name, time});
+        else empty.push_back(name);
+    }
+    const auto latest = [&] {
+        return std::max_element(existing.begin(), existing.end(),
+            [](const Existing &a, const Existing &b) { return a.time < b.time; })->name;
+    };
+    const std::uint32_t focus = runtime.memory().load32(parameter_address + 0x5C8u);
+    if (saving) {
+        if (!existing.empty()) return latest();
+        return focus == LastEmpty || focus == LastList ? names.back() : names.front();
+    }
+    if (existing.empty()) return std::nullopt;
+    switch (focus) {
+    case FirstList: return existing.front().name;
+    case LastList: return existing.back().name;
+    case Oldest:
+        return std::min_element(existing.begin(), existing.end(),
+            [](const Existing &a, const Existing &b) { return a.time < b.time; })->name;
+    default: return latest();
+    }
+}
+
+// Parameter size, buffer sizes, secure fields (key at 0x5DC, secureVersion at
+// 0x5EC), list cursor and titles of a savedata request, for the [savedata] log line.
+std::string savedata_debug_summary(psprecomp::Runtime &runtime, std::uint32_t parameter_address) {
+    const auto &memory = runtime.memory();
+    const std::uint32_t declared_size = memory.load32(parameter_address);
+    std::string text = " size=" + psprecomp::hex32(declared_size) +
+                       " buf=" + psprecomp::hex32(memory.load32(parameter_address + kSavedataDataBufferOffset)) +
+                       "/" + std::to_string(memory.load32(parameter_address + kSavedataDataBufferSizeOffset)) +
+                       " data=" + std::to_string(memory.load32(parameter_address + kSavedataDataSizeOffset));
+    if (declared_size >= 0x5F0u) {
+        // Only whether the game passes its savedata key, never the key itself.
+        bool has_key = false;
+        for (std::uint32_t index = 0u; index < 16u; ++index)
+            has_key = has_key || memory.load8(parameter_address + 0x5DCu + index) != 0u;
+        text += has_key ? " key=set" : " key=none";
+        text += " secure=" + std::to_string(memory.load32(parameter_address + 0x5ECu));
+    }
+    text += " focus=" + std::to_string(memory.load32(parameter_address + 0x5C8u));
+    const std::uint32_t list = memory.load32(parameter_address + 0x60u);
+    if (list != 0u && memory.contains(list, 20u)) {
+        text += " list=[";
+        for (std::uint32_t index = 0u; index < 16u && memory.contains(list + index * 20u, 20u); ++index) {
+            const std::string name = read_fixed_string(memory, list + index * 20u, 20u);
+            if (name.empty()) break;
+            text += (index == 0u ? "" : ",") + name;
+        }
+        text += "]";
+    }
+    text += " title=\"" + read_fixed_string(memory, parameter_address + 0x80u, 0x80u) + "\"";
+    text += " stitle=\"" + read_fixed_string(memory, parameter_address + 0x100u, 0x80u) + "\"";
+    return text;
+}
+
 std::uint32_t execute_savedata_operation(psprecomp::Runtime &runtime, std::uint32_t parameter_address) {
     const std::uint32_t mode = runtime.memory().load32(parameter_address + kSavedataModeOffset);
     const std::string file_name_value = safe_savedata_component(read_fixed_string(
         runtime.memory(), parameter_address + kSavedataFileNameOffset, 13u));
     const std::string file_name = file_name_value.empty() ? "DATA.BIN" : file_name_value;
+    if (mode == 4u || mode == 5u) {
+        const auto chosen = choose_savedata_list_entry(runtime, parameter_address, file_name, mode == 5u);
+        if (chosen) {
+            store_fixed_string(runtime.memory(), parameter_address + kSavedataSaveNameOffset, 20u, *chosen);
+        } else if (mode == 4u && !savedata_name_list(runtime.memory(), parameter_address).empty()) {
+            return 0x80110307u;
+        }
+    }
     const auto directory = savedata_directory(runtime, parameter_address);
     const auto data_path = directory / file_name;
     switch (mode) {
     case 0u: // AUTOLOAD
     case 2u: // LOAD
-    case 4u: // LISTLOAD (selected saveName is already supplied by the game)
+    case 4u: // LISTLOAD (entry picked above)
         return load_savedata_file(runtime, parameter_address, data_path, false);
     case 1u: // AUTOSAVE
     case 3u: // SAVE
-    case 5u: // LISTSAVE
+    case 5u: // LISTSAVE (entry picked above)
         return save_savedata_file(runtime, parameter_address, data_path, false);
     case 9u: // AUTODELETE
     case 10u: // DELETE
@@ -7164,7 +7354,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                                      " game=" + read_fixed_string(rt.memory(), parameter + kSavedataGameNameOffset, 13u) +
                                      " save=" + read_fixed_string(rt.memory(), parameter + kSavedataSaveNameOffset, 20u) +
                                      " file=" + read_fixed_string(rt.memory(), parameter + kSavedataFileNameOffset, 13u) +
-                                     " -> " + psprecomp::hex32(result));
+                                     " -> " + psprecomp::hex32(result) + savedata_debug_summary(rt, parameter));
                 }
                 savedata_utility.operation_complete = true;
                 savedata_utility.status = UtilityStatus::Quit;
