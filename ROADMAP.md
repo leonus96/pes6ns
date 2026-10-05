@@ -89,7 +89,7 @@ Cada fase tiene **tareas**, **criterio de terminado (DoD)** y **estimación** pa
 
 ### Fase 1 — Toolchain y "hola mundo" en Switch  *(1–3 días)*
 - [x] Instalar devkitPro y compilar un ejemplo de `switch-examples` (gráficos con SDL2 + un framebuffer de libnx). *(ejemplo propio `switch/hello` con framebuffer de libnx; probado en la consola)*
-- [ ] Configurar `nxlink` y verificar logs (`printf` → terminal del Mac).
+- [ ] Configurar `nxlink` y verificar logs (`printf` → terminal del Mac). *(el usuario transfiere con MTP Responder + OpenMTP; nxlink aún sin probar)*
 - [x] Crear una plantilla CMake mínima con `-DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake`, `nx_generate_nacp`, `nx_create_nro`. *(`switch/hello/`; compila sin warnings en la imagen `devkitpro/devkita64` (GCC 15.2) → `pes6_hello.nro` de 207 KB)*
 - [x] Workflow de GitHub Actions que construya el `.nro` y lo suba como artifact. *(`.github/workflows/ci.yml`: job `switch-hello` + job `framework` en macOS/Linux; en verde desde `a359cb2`)*
 
