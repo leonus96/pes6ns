@@ -55,6 +55,7 @@ struct CaptureState {
     std::filesystem::path directory;
     std::uint32_t limit{8u};
     std::uint64_t start_vblank{};
+    std::uint64_t interval{1u};
     std::uint64_t vblank_index{};
     std::uint32_t dumped{};
     std::optional<std::uint64_t> previous_hash;
@@ -83,6 +84,12 @@ void initialize_capture_state(CaptureState &state) {
         char *end = nullptr;
         const unsigned long long value = std::strtoull(start, &end, 0);
         if (end != start && *end == '\0') state.start_vblank = value;
+    }
+    // PSPRECOMP_FRAME_DUMP_INTERVAL=N keeps only every Nth vblank (long routes).
+    if (const char *interval = std::getenv("PSPRECOMP_FRAME_DUMP_INTERVAL")) {
+        char *end = nullptr;
+        const unsigned long long value = std::strtoull(interval, &end, 0);
+        if (end != interval && *end == '\0' && value != 0u) state.interval = value;
     }
 }
 
@@ -242,6 +249,7 @@ void capture_frame_if_requested(const psprecomp::GuestMemory &memory,
     if (!state.enabled) return;
     ++state.vblank_index;
     if (state.vblank_index < state.start_vblank) return;
+    if ((state.vblank_index - state.start_vblank) % state.interval != 0u) return;
     if (state.limit != 0u && state.dumped >= state.limit) return;
     if (description.address == 0u || description.width == 0u || description.height == 0u ||
         description.stride == 0u) return;

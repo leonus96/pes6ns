@@ -624,7 +624,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
                 missing_function_resolver_(*this, before))
                 function = lookup_function(before);
             if (function == nullptr) {
-                stop("No recompiled function registered at " + hex32(before));
+                stop("No recompiled function registered at " + hex32(before) + " (ra=" + hex32(cpu_.gpr[31]) + ")");
                 return;
             }
             g_runtime_dispatch_pc = before;
@@ -704,7 +704,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
                 missing_function_resolver_(*this, before))
                 function = lookup_function(before);
             if (function == nullptr) {
-                stop("No recompiled function registered at " + hex32(before));
+                stop("No recompiled function registered at " + hex32(before) + " (ra=" + hex32(cpu_.gpr[31]) + ")");
                 break;
             }
             g_runtime_dispatch_pc = before;
@@ -766,7 +766,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
             function = lookup_function(before);
         const FunctionEntry *function_entry = lookup_entry(before);
         if (function == nullptr) {
-            stop("No recompiled function registered at " + hex32(before));
+            stop("No recompiled function registered at " + hex32(before) + " (ra=" + hex32(cpu_.gpr[31]) + ")");
             break;
         }
         g_runtime_dispatch_pc = before;

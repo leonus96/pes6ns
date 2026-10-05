@@ -1315,11 +1315,35 @@ std::uint64_t parse_environment_u64(const char *name, std::uint64_t fallback = 0
     return end != text && *end == '\0' ? static_cast<std::uint64_t>(value) : fallback;
 }
 
-const std::array<ControllerPulseConfig, 8> &controller_pulse_configs() {
-    static const std::array<ControllerPulseConfig, 8> configs = [] {
-        std::array<ControllerPulseConfig, 8> values{};
+// PSPRECOMP_CTRL_ROUTE="BUTTONS@START[+LENGTH],..." adds any number of pulses
+// (LENGTH defaults to 8 vblanks) after the eight numbered PULSE variables.
+void append_controller_route(std::vector<ControllerPulseConfig> &values) {
+    const char *text = std::getenv("PSPRECOMP_CTRL_ROUTE");
+    if (text == nullptr) return;
+    std::string route = text;
+    std::size_t position = 0;
+    while (position < route.size()) {
+        std::size_t comma = route.find_first_of(", ", position);
+        if (comma == std::string::npos) comma = route.size();
+        const std::string item = route.substr(position, comma - position);
+        position = comma + 1;
+        const std::size_t at = item.find('@');
+        if (at == std::string::npos) continue;
+        const std::size_t plus = item.find('+', at);
+        ControllerPulseConfig value{};
+        value.buttons = static_cast<std::uint32_t>(std::strtoull(item.substr(0, at).c_str(), nullptr, 0));
+        value.start_vblank = std::strtoull(item.substr(at + 1, plus == std::string::npos ? std::string::npos : plus - at - 1).c_str(), nullptr, 0);
+        const std::uint64_t length = plus == std::string::npos ? 8u : std::strtoull(item.substr(plus + 1).c_str(), nullptr, 0);
+        value.end_vblank = value.start_vblank + length;
+        values.push_back(value);
+    }
+}
+
+const std::vector<ControllerPulseConfig> &controller_pulse_configs() {
+    static const std::vector<ControllerPulseConfig> configs = [] {
+        std::vector<ControllerPulseConfig> values(8);
         constexpr std::array<const char *, 8> suffixes{"", "2", "3", "4", "5", "6", "7", "8"};
-        for (std::size_t index = 0; index < values.size(); ++index) {
+        for (std::size_t index = 0; index < suffixes.size(); ++index) {
             const std::string suffix = suffixes[index];
             const std::string prefix = "PSPRECOMP_CTRL_PULSE" + suffix;
             const std::string buttons_name = prefix + "_BUTTONS";
@@ -1341,6 +1365,7 @@ const std::array<ControllerPulseConfig, 8> &controller_pulse_configs() {
                 value.has_ly = true;
             }
         }
+        append_controller_route(values);
         return values;
     }();
     return configs;

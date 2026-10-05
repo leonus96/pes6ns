@@ -22,9 +22,9 @@ with the identity (load address, size, FNV-1a hash) of every image so the host
 only activates translations that match the bytes in guest memory.
 
 Overlays are mostly entered from the EBOOT (`jal` to fixed overlay addresses)
-or from other overlays, so every jal/j target and pointer-sized data word
-of the EBOOT and of all overlays that lands in an overlay's text is passed to
-psp_recomp as an external seed.
+or from other overlays, so every jal/j target, every lui+addiu/ori address
+constant and every pointer-sized data word of the EBOOT and of all overlays
+that lands in an overlay's text is passed to psp_recomp as an external seed.
 
     extract_overlays.py <over.afs> <psp_recomp> <profile_dir> <decrypted EBOOT>
 """
@@ -75,14 +75,39 @@ def elf_sections(blob: bytes):
     return out
 
 
+LUI_WINDOW = 32  # instructions after a lui searched for its addiu/ori
+
+
+def lui_pairs(code):
+    """Addresses built with `lui rt, hi` + `addiu/ori rx, rt, lo` (function pointers
+    passed as arguments, e.g. callbacks the EBOOT registers inside game.ovl)."""
+    words = struct.unpack_from(f'<{len(code) // 4}I', code)
+    for i, word in enumerate(words):
+        if word >> 26 != 0x0F:
+            continue
+        rt, hi = (word >> 16) & 0x1F, word & 0xFFFF
+        for next_word in words[i + 1:i + 1 + LUI_WINDOW]:
+            op, rs, dest = next_word >> 26, (next_word >> 21) & 0x1F, (next_word >> 16) & 0x1F
+            if op in (0x09, 0x0D) and rs == rt:
+                lo = next_word & 0xFFFF
+                if op == 0x09 and lo & 0x8000:
+                    lo -= 0x10000
+                yield ((hi << 16) + lo) & 0xFFFFFFFF if op == 0x09 else (hi << 16) | lo
+            # Stop once rt is overwritten (I-type rt or R-type rd destinations).
+            if (op not in (0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x14, 0x15, 0x16, 0x17)
+                    and op < 0x28 and dest == rt) or (op == 0x00 and (next_word >> 11) & 0x1F == rt):
+                break
+
+
 def references(code_regions, data_regions):
-    """Targets of j/jal in code plus every word stored in data."""
+    """Targets of j/jal and lui/addiu address pairs in code plus every word stored in data."""
     targets = set()
     for addr, code in code_regions:
         for i in range(0, len(code) - 3, 4):
             word, = struct.unpack_from('<I', code, i)
             if word >> 26 in (2, 3):
                 targets.add(((addr + i + 4) & 0xF0000000) | ((word & 0x03FFFFFF) << 2))
+        targets.update(lui_pairs(code[:len(code) & ~3]))
     for addr, data in data_regions:
         for i in range(0, len(data) - 3, 4):
             targets.add(struct.unpack_from('<I', data, i)[0])
