@@ -290,6 +290,20 @@ static std::vector<std::uint8_t> make_branch_delay_test_elf() {
     return bytes;
 }
 
+// A call into a bucket that holds emitted code but outside the analysed image
+// (e.g. another overlay ending just below this one in the same 16 KiB bucket)
+// must not use the bucket's unit: it has no entry for that PC.
+[[maybe_unused]] static std::vector<std::uint8_t> make_foreign_bucket_call_test_elf() {
+    auto bytes = make_cross_unit_branch_test_elf();
+    put32(bytes, 0x80u, 0x0E201010u); // jal 0x08804040 (entry of unit 1)
+    put32(bytes, 0x84u, 0x00000000u); // nop
+    put32(bytes, 0x88u, 0x0E201018u); // jal 0x08804060 (unit 1 bucket, outside the image)
+    put32(bytes, 0x8Cu, 0x00000000u); // nop
+    put32(bytes, 0x90u, 0x03E00008u); // jr ra
+    put32(bytes, 0x94u, 0x00000000u); // nop
+    return bytes;
+}
+
 static std::vector<std::uint8_t> make_vfpu_branch_test_elf() {
     auto bytes = make_branch_delay_test_elf();
     const std::uint32_t code[] = {
@@ -760,6 +774,40 @@ static void test_automatic_cross_unit_tail_chaining() {
             "Automatic codegen did not include cross-unit native declarations");
     require(text.find("runtime.register_generated_unit(0u, 0x08804000u, 64u, &recomp_unit_0000, &recomp_unit_0000_entry);") != std::string::npos,
             "Automatic codegen did not register the dense generated-unit fast table");
+    std::filesystem::remove_all(root);
+#endif
+}
+
+static void test_automatic_call_outside_image_in_emitted_bucket() {
+#if defined(PSPRECOMP_TESTS_NO_SUBPROCESS)
+    report_skipped_subprocess_test(__func__);
+#elif !defined(PSPRECOMP_CODEGEN_PATH)
+    throw std::runtime_error("PSPRECOMP_CODEGEN_PATH was not provided by CMake");
+#else
+    const auto root = std::filesystem::temp_directory_path() / "psprecomp_foreign_bucket_call_test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const auto elf_path = root / "foreign_bucket_call.elf";
+    const auto generated_dir = root / "generated";
+    const auto bytes = make_foreign_bucket_call_test_elf();
+    { std::ofstream out(elf_path, std::ios::binary); out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size())); }
+
+    const std::filesystem::path codegen_path = PSPRECOMP_CODEGEN_PATH;
+    const std::string command = shell_quote(codegen_path) + " " + shell_quote(elf_path) +
+        " --auto " + shell_quote(generated_dir) + " 0x08804000 64";
+    require(std::system(shell_command(command).c_str()) == 0,
+            "psp_recomp foreign-bucket fixture generation failed");
+    std::string text;
+    {
+        std::ifstream generated(generated_dir / "generated_unit_0000.cpp");
+        text.assign((std::istreambuf_iterator<char>(generated)), std::istreambuf_iterator<char>());
+    }
+    require(text.find("invoke_chained_direct<&recomp_unit_0001_entry, 1u, 1u, 0x08804040u>") != std::string::npos,
+            "Call to a unit entry no longer uses the direct-entry chain");
+    require(text.find("invoke_chained_direct<&recomp_unit_0001, 1u>") == std::string::npos,
+            "Call outside the image was sent to the unit owning its bucket");
+    require(text.find("ctx.pc = 0x08804060u;") != std::string::npos,
+            "Call outside the image does not hand its target PC to the runtime");
     std::filesystem::remove_all(root);
 #endif
 }
@@ -1688,6 +1736,7 @@ int PSPRECOMP_TESTS_ENTRY() {
         test_vfpu_branch_cfg_discovery();
         test_automatic_cfg_and_codegen();
         test_automatic_cross_unit_tail_chaining();
+        test_automatic_call_outside_image_in_emitted_bucket();
         test_materialized_function_pointer_discovery();
 
         auto relocation_elf = psprecomp::Elf32Image::from_bytes(make_relocation_test_prx(), "synthetic_relocation.prx");

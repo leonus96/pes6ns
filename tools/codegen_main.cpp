@@ -872,18 +872,18 @@ std::string direct_unit_chain_expression(
         std::to_string(unit) + "u>(ctx, &aot_mem)";
 }
 
-// A direct unit edge needs its destination bucket to have been emitted.
-// Fixed targets outside the analysed image (for example code a title loads
-// into its BSS at runtime) must go through the runtime dispatcher instead.
+// A direct unit edge needs the destination itself to be an entry of an emitted
+// unit. Fixed targets outside the analysed image (for example code a title
+// loads into its BSS at runtime) must go through the runtime dispatcher
+// instead -- including targets that share a bucket with emitted code, such as
+// another overlay ending just below this one: the unit cannot enter them, and
+// the direct expression does not store ctx.pc.
 bool has_generated_unit(std::uint32_t target, std::uint32_t executable_base,
                         std::uint32_t unit_span_bytes,
                         const std::map<std::uint32_t, std::uint16_t> *direct_entry_ids) {
     if (unit_span_bytes == 0u || target < executable_base) return false;
     if (direct_entry_ids == nullptr) return true;
-    const std::uint64_t start = executable_base +
-        static_cast<std::uint64_t>((target - executable_base) / unit_span_bytes) * unit_span_bytes;
-    const auto found = direct_entry_ids->lower_bound(static_cast<std::uint32_t>(start));
-    return found != direct_entry_ids->end() && found->first < start + unit_span_bytes;
+    return direct_entry_ids->contains(target);
 }
 
 void emit_target(std::ostringstream &body, std::uint32_t target,
