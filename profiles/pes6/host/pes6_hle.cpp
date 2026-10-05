@@ -2484,6 +2484,8 @@ void enqueue_continuation(std::int32_t uid, const psprecomp::AllegrexContext &co
 }
 
 bool activate_next_thread(psprecomp::AllegrexContext &ctx, const char *reason);
+bool start_due_alarm_thread();
+std::uint64_t earliest_alarm_due_us();
 
 std::uint32_t thread_priority(std::int32_t uid) {
     const auto found = thread_table.threads.find(uid);
@@ -2562,6 +2564,7 @@ bool activate_next_thread(psprecomp::AllegrexContext &ctx, const char *reason) {
                            return thread == thread_table.threads.end() || thread->second.externally_suspended;
                        }),
         thread_table.continuations.end());
+    (void)start_due_alarm_thread();
     if (thread_table.continuations.empty()) {
         std::uint64_t earliest = UINT64_MAX;
         for (const auto &[uid, thread] : thread_table.threads) {
@@ -2569,11 +2572,14 @@ bool activate_next_thread(psprecomp::AllegrexContext &ctx, const char *reason) {
             if (thread.state == ThreadState::Delayed)
                 earliest = std::min(earliest, thread.delay_until_us);
         }
+        // Pending alarms are timer interrupts: they can be the next event.
+        earliest = std::min(earliest, earliest_alarm_due_us());
         if (earliest != UINT64_MAX) {
             // The recomp runtime uses deterministic virtual PSP time.  When no
             // thread is runnable, advance directly to the next kernel wakeup.
             virtual_time_us = std::max(virtual_time_us, earliest);
             promote_expired_delays();
+            (void)start_due_alarm_thread();
         }
     }
     if (thread_table.continuations.empty()) return false;
@@ -3026,24 +3032,48 @@ struct AlarmRecord {
 std::int32_t next_alarm_uid{0x700};
 std::map<std::int32_t, AlarmRecord> alarms;
 
-bool maybe_start_due_alarm(psprecomp::AllegrexContext &ctx) {
-    if (alarms.empty()) return false;
-    const auto thread = thread_table.threads.find(thread_table.current_uid);
-    if (thread == thread_table.threads.end() || thread->second.state != ThreadState::Running) return false;
-    const auto frames = async_return_frames.find(thread_table.current_uid);
-    if (frames != async_return_frames.end() && !frames->second.empty()) return false;
+// Alarm handlers run on a dedicated interrupt "thread" with the highest
+// priority, so they fire on time even when every guest thread is waiting:
+// the PSP delivers them from a timer interrupt, not from a running thread.
+constexpr std::int32_t kAlarmThreadUid = 0x7FFF;
+constexpr std::uint32_t kAlarmThreadStackSize = 0x4000u;
+bool alarm_thread_busy{};
+std::int32_t alarm_thread_alarm_uid{};
+std::uint32_t alarm_gp{};
+
+std::uint64_t earliest_alarm_due_us() {
+    if (alarm_thread_busy) return UINT64_MAX;
+    std::uint64_t earliest = UINT64_MAX;
+    for (const auto &[uid, alarm] : alarms) earliest = std::min(earliest, alarm.due_us);
+    return earliest;
+}
+
+bool start_due_alarm_thread() {
+    if (alarm_thread_busy || alarms.empty()) return false;
     auto due = alarms.end();
     for (auto it = alarms.begin(); it != alarms.end(); ++it) {
         if (it->second.due_us <= virtual_time_us && (due == alarms.end() || it->second.due_us < due->second.due_us))
             due = it;
     }
     if (due == alarms.end()) return false;
-    AsyncReturnFrame frame{AsyncReturnKind::Alarm, ctx};
-    frame.callback_uid = due->first;
-    async_return_frames[thread_table.current_uid].push_back(frame);
-    ctx.set_gpr(4, due->second.common);
-    ctx.set_gpr(31, 0x00000004u);
-    ctx.pc = due->second.handler;
+    auto thread = thread_table.threads.find(kAlarmThreadUid);
+    if (thread == thread_table.threads.end()) {
+        ThreadRecord record{};
+        record.name = "alarm-intr";
+        record.priority = 0u;
+        record.stack_size = kAlarmThreadStackSize;
+        if (!allocate_thread_stack(kAlarmThreadStackSize, record.stack_bottom, record.stack_top)) return false;
+        thread = thread_table.threads.emplace(kAlarmThreadUid, record).first;
+    }
+    psprecomp::AllegrexContext context{};
+    context.set_gpr(28, alarm_gp);
+    context.set_gpr(29, thread->second.stack_top - 0x40u);
+    context.set_gpr(4, due->second.common);
+    context.set_gpr(31, 0x00000004u);
+    context.pc = due->second.handler;
+    alarm_thread_busy = true;
+    alarm_thread_alarm_uid = due->first;
+    enqueue_continuation(kAlarmThreadUid, context);
     if (std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr)
         std::cerr << "[alarm] fire uid=" << due->first << " handler=" << psprecomp::hex32(due->second.handler)
                   << " t=" << virtual_time_us << "\n";
@@ -3055,7 +3085,7 @@ void pes6_post_import_hook(psprecomp::Runtime &runtime, psprecomp::AllegrexConte
         ge_async_drain_completions();
         if (!ge_async_check_fatal(runtime)) return;
     }
-    if (maybe_start_due_alarm(ctx)) return;
+    if (start_due_alarm_thread() && preempt_if_higher_priority(ctx, "alarm")) return;
     (void)maybe_start_pending_guest_callback(ctx);
 }
 
@@ -4217,6 +4247,19 @@ bool continue_mpeg_ringbuffer_callback(psprecomp::Runtime &runtime,
 }
 
 void pes6_interrupt_return(psprecomp::Runtime &runtime, psprecomp::AllegrexContext &ctx) {
+    if (thread_table.current_uid == kAlarmThreadUid) {
+        const std::uint32_t rearm_us = ctx.gpr[2];
+        if (const auto alarm = alarms.find(alarm_thread_alarm_uid); alarm != alarms.end()) {
+            if (rearm_us == 0u) alarms.erase(alarm);
+            else alarm->second.due_us = virtual_time_us + rearm_us;
+        }
+        alarm_thread_busy = false;
+        if (auto thread = thread_table.threads.find(kAlarmThreadUid); thread != thread_table.threads.end())
+            thread->second.state = ThreadState::Created; // dormant until the next alarm
+        if (!activate_next_thread(ctx, "alarm-return"))
+            runtime.stop("PSP scheduler deadlock after an alarm handler");
+        return;
+    }
     const std::int32_t uid = thread_table.current_uid;
     const auto found = async_return_frames.find(uid);
     if (found == async_return_frames.end() || found->second.empty()) {
@@ -4401,6 +4444,21 @@ void register_io_sync(psprecomp::Runtime &runtime, std::uint32_t nid, psprecomp:
 // counterpart at submission and parks the 64-bit result until the guest waits
 // or polls for it.
 std::unordered_map<std::int32_t, std::uint64_t> io_async_results;
+// Virtual time at which each fd's pending async operation completes. A UMD
+// read takes milliseconds on hardware, and PES6's loader is only correct with
+// that latency: with instant completion its request bookkeeping races and the
+// menu load stalls. PES6_IO_LATENCY=0 restores instant completion.
+std::unordered_map<std::int32_t, std::uint64_t> io_async_ready_us;
+
+std::uint64_t umd_latency_us(std::uint64_t bytes) {
+    static const bool enabled = [] {
+        const char *text = std::getenv("PES6_IO_LATENCY");
+        return text == nullptr || std::string(text) != "0";
+    }();
+    if (!enabled) return 0u;
+    // ~2 ms access + ~1.6 MB/s sustained, in the range PSP UMD reads measure.
+    return 2000u + bytes * 10u / 16u;
+}
 
 std::uint64_t run_io_sync(std::uint32_t nid, psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
     io_sync_handlers.at(nid)(rt, ctx);
@@ -4609,7 +4667,9 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
     install_auto_dialogs(runtime);
     open_disc_image(runtime.game_root());
     alarms.clear();
+    alarm_thread_busy = false;
     io_async_results.clear();
+    io_async_ready_us.clear();
     umd_callback_uid = -1;
     umd_activated = false;
     // --- ModuleMgrForUser -------------------------------------------------
@@ -4817,6 +4877,7 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
             const std::uint32_t size = ctx.gpr[6];
             const std::uint64_t result = run_io_sync(0x6A638D83u, rt, ctx);
             io_async_results[fd] = static_cast<std::uint64_t>(sign_extend_result(result, false));
+            io_async_ready_us[fd] = virtual_time_us + umd_latency_us(size);
             if (runtime_log_enabled())
                 runtime_log_line("[io] readAsync fd=" + std::to_string(fd) + " dst=" + psprecomp::hex32(destination) +
                                  " size=" + psprecomp::hex32(size) + " -> " + psprecomp::hex32(static_cast<std::uint32_t>(result)));
@@ -4838,34 +4899,51 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
             io_async_results[fd] = static_cast<std::uint64_t>(sign_extend_result(result, false));
             set_success(ctx);
         });
-    const auto wait_async = [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+    // sceIoPollAsync (poll=true) reports 1 while the operation is in flight;
+    // sceIoWaitAsync[CB] delays the thread until it completes.
+    const auto complete_async = [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx, bool poll) {
         const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
         const auto found = io_async_results.find(fd);
         if (found == io_async_results.end()) { ctx.set_gpr(2, kNoAsyncPending); return; }
+        const auto ready = io_async_ready_us.find(fd);
+        const std::uint64_t ready_us = ready != io_async_ready_us.end() ? ready->second : 0u;
+        if (poll && ready_us > virtual_time_us) { ctx.set_gpr(2, 1u); return; }
         const std::uint32_t out = ctx.gpr[5];
         if (out != 0u && rt.memory().contains(out, 8u)) {
             rt.memory().store32(out, static_cast<std::uint32_t>(found->second));
             rt.memory().store32(out + 4u, static_cast<std::uint32_t>(found->second >> 32u));
         }
         io_async_results.erase(found);
+        if (ready != io_async_ready_us.end()) io_async_ready_us.erase(ready);
+        if (!poll && ready_us > virtual_time_us) {
+            (void)delay_current_thread(rt, ctx, static_cast<std::uint32_t>(ready_us - virtual_time_us), 0u);
+            return;
+        }
         set_success(ctx);
     };
-    const auto logged = [wait_async](const char *name) {
-        return [wait_async, name](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+    const auto wait_async = [complete_async](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+        complete_async(rt, ctx, false);
+    };
+    const auto poll_async = [complete_async](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+        complete_async(rt, ctx, true);
+    };
+    const auto logged = [](const char *name, auto handler) {
+        return [handler, name](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
-            wait_async(rt, ctx);
+            handler(rt, ctx);
             if (runtime_log_enabled())
                 runtime_log_line(std::string("[io] ") + name + " fd=" + std::to_string(fd) + " -> " + psprecomp::hex32(ctx.gpr[2]) +
                                  " v=" + std::to_string(display_vblank_index));
         };
     };
-    runtime.register_hle("IoFileMgrForUser", 0xE23EEC33u, logged("waitAsync"));   // sceIoWaitAsync
-    runtime.register_hle("IoFileMgrForUser", 0x35DBD746u, logged("waitAsyncCB")); // sceIoWaitAsyncCB
-    runtime.register_hle("IoFileMgrForUser", 0x3251EA56u, logged("pollAsync"));   // sceIoPollAsync: always complete
+    runtime.register_hle("IoFileMgrForUser", 0xE23EEC33u, logged("waitAsync", wait_async));   // sceIoWaitAsync
+    runtime.register_hle("IoFileMgrForUser", 0x35DBD746u, logged("waitAsyncCB", wait_async)); // sceIoWaitAsyncCB
+    runtime.register_hle("IoFileMgrForUser", 0x3251EA56u, logged("pollAsync", poll_async));   // sceIoPollAsync
 
     runtime.register_hle("ThreadManForUser", 0x6652B8CAu, // sceKernelSetAlarm
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
             const std::int32_t uid = next_alarm_uid++;
+            alarm_gp = ctx.gpr[28];
             alarms[uid] = AlarmRecord{virtual_time_us + ctx.gpr[4], ctx.gpr[5], ctx.gpr[6]};
             ctx.set_gpr(2, static_cast<std::uint32_t>(uid));
         });

@@ -138,6 +138,13 @@ int main(int argc, char **argv) {
         }
 
         std::cout << "Runtime stopped: " << runtime.stop_reason() << "\n";
+        // PES6_EXIT_RAM_DUMP=<file>: snapshot user RAM when the run ends normally.
+        if (const char *dump = std::getenv("PES6_EXIT_RAM_DUMP"); dump != nullptr && *dump != '\0') {
+            std::vector<std::uint8_t> ram(32u * 1024u * 1024u);
+            runtime.memory().copy_out(0x08000000u, ram);
+            std::ofstream(dump, std::ios::binary).write(reinterpret_cast<const char *>(ram.data()),
+                                                       static_cast<std::streamsize>(ram.size()));
+        }
         psprecomp::report_counted_pcs();
         runtime.report_hle_histogram(250u);
         pes6::report_disc_read_stats();
