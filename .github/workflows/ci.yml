@@ -7,8 +7,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Phase 1: standalone libnx homebrew -> .nro artifact.
-  switch-hello:
+  # Switch homebrew -> .nro artifacts:
+  #   hello    - Phase 1 smoke test (framebuffer, pad, nxlink)
+  #   selftest - PSPRecomp framework regression tests running on the console
+  switch:
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [hello, selftest]
     runs-on: ubuntu-latest
     # Ships devkitA64, libnx, switch-cmake (nx_create_nro), switch-portlibs,
     # host cmake and ninja. DEVKITPRO is set by the image.
@@ -18,17 +24,17 @@ jobs:
 
       - name: Configure
         run: >
-          cmake -S switch/hello -B out/switch-hello -G Ninja
+          cmake -S switch/${{ matrix.app }} -B out/switch-${{ matrix.app }} -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake"
 
       - name: Build
-        run: cmake --build out/switch-hello
+        run: cmake --build out/switch-${{ matrix.app }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pes6_hello-nro
-          path: out/switch-hello/pes6_hello.nro
+          name: pes6_${{ matrix.app }}-nro
+          path: out/switch-${{ matrix.app }}/pes6_${{ matrix.app }}.nro
           if-no-files-found: error
           retention-days: 14
 

@@ -256,7 +256,7 @@ static std::vector<std::uint8_t> make_branch_delay_test_elf() {
     return bytes;
 }
 
-static std::vector<std::uint8_t> make_cross_unit_branch_test_elf() {
+[[maybe_unused]] static std::vector<std::uint8_t> make_cross_unit_branch_test_elf() {
     std::vector<std::uint8_t> bytes(0xC8u, 0u);
     bytes[0] = 0x7Fu; bytes[1] = 'E'; bytes[2] = 'L'; bytes[3] = 'F';
     bytes[4] = 1u; bytes[5] = 1u; bytes[6] = 1u;
@@ -320,7 +320,7 @@ static std::vector<std::uint8_t> make_link_branch_test_elf() {
     return bytes;
 }
 
-static std::vector<std::uint8_t> make_divzero_codegen_test_elf() {
+[[maybe_unused]] static std::vector<std::uint8_t> make_divzero_codegen_test_elf() {
     auto bytes = make_branch_delay_test_elf();
     const std::uint32_t code[] = {
         0x0080001Au, // div  a0, zero
@@ -332,7 +332,7 @@ static std::vector<std::uint8_t> make_divzero_codegen_test_elf() {
     return bytes;
 }
 
-static std::vector<std::uint8_t> make_vh2f_test_elf() {
+[[maybe_unused]] static std::vector<std::uint8_t> make_vh2f_test_elf() {
     auto bytes = make_branch_delay_test_elf();
     const std::uint32_t code[] = {
         0xD0330000u, // vh2f.p C000, S000
@@ -348,7 +348,7 @@ static std::vector<std::uint8_t> make_vh2f_test_elf() {
     return bytes;
 }
 
-static std::string shell_quote(const std::filesystem::path &path) {
+[[maybe_unused]] static std::string shell_quote(const std::filesystem::path &path) {
 #ifdef _WIN32
     std::string value = path.string();
     std::string escaped = "\"";
@@ -366,7 +366,7 @@ static std::string shell_quote(const std::filesystem::path &path) {
 // outermost quote pair when the line starts with one.  A build directory such
 // as "Nova pasta (4)" then splits at the first space and the tool is not found.
 // Wrapping the whole line in one more quote pair is the documented workaround.
-static std::string shell_command(const std::string &command) {
+[[maybe_unused]] static std::string shell_command(const std::string &command) {
 #ifdef _WIN32
     return "\"" + command + "\"";
 #else
@@ -374,8 +374,17 @@ static std::string shell_command(const std::string &command) {
 #endif
 }
 
+// Hosts that cannot spawn processes (e.g. Switch homebrew) define
+// PSPRECOMP_TESTS_NO_SUBPROCESS; the psp_recomp fixture tests are then
+// reported as skipped instead of failing.
+[[maybe_unused]] static void report_skipped_subprocess_test(const char *name) {
+    std::cout << "Skipped (needs psp_recomp subprocess): " << name << "\n";
+}
+
 static void test_codegen_branch_before_delay_slot() {
-#ifndef PSPRECOMP_CODEGEN_PATH
+#if defined(PSPRECOMP_TESTS_NO_SUBPROCESS)
+    report_skipped_subprocess_test(__func__);
+#elif !defined(PSPRECOMP_CODEGEN_PATH)
     throw std::runtime_error("PSPRECOMP_CODEGEN_PATH was not provided by CMake");
 #else
     const auto root = std::filesystem::temp_directory_path() / "psprecomp_branch_codegen_test";
@@ -415,7 +424,9 @@ static void test_codegen_branch_before_delay_slot() {
 
 
 static void test_codegen_vfpu_branch_before_delay_slot() {
-#ifndef PSPRECOMP_CODEGEN_PATH
+#if defined(PSPRECOMP_TESTS_NO_SUBPROCESS)
+    report_skipped_subprocess_test(__func__);
+#elif !defined(PSPRECOMP_CODEGEN_PATH)
     throw std::runtime_error("PSPRECOMP_CODEGEN_PATH was not provided by CMake");
 #else
     const auto root = std::filesystem::temp_directory_path() / "psprecomp_vfpu_branch_codegen_test";
@@ -449,7 +460,9 @@ static void test_codegen_vfpu_branch_before_delay_slot() {
 }
 
 static void test_codegen_link_branch_before_delay_slot() {
-#ifndef PSPRECOMP_CODEGEN_PATH
+#if defined(PSPRECOMP_TESTS_NO_SUBPROCESS)
+    report_skipped_subprocess_test(__func__);
+#elif !defined(PSPRECOMP_CODEGEN_PATH)
     throw std::runtime_error("PSPRECOMP_CODEGEN_PATH was not provided by CMake");
 #else
     const auto root = std::filesystem::temp_directory_path() / "psprecomp_link_branch_codegen_test";
@@ -487,7 +500,9 @@ static void test_codegen_link_branch_before_delay_slot() {
 }
 
 static void test_codegen_zero_divisor_constant_folding() {
-#ifndef PSPRECOMP_CODEGEN_PATH
+#if defined(PSPRECOMP_TESTS_NO_SUBPROCESS)
+    report_skipped_subprocess_test(__func__);
+#elif !defined(PSPRECOMP_CODEGEN_PATH)
     throw std::runtime_error("PSPRECOMP_CODEGEN_PATH was not provided by CMake");
 #else
     const auto root = std::filesystem::temp_directory_path() / "psprecomp_divzero_codegen_test";
@@ -522,7 +537,9 @@ static void test_codegen_zero_divisor_constant_folding() {
 }
 
 static void test_codegen_vh2f_lowering() {
-#ifndef PSPRECOMP_CODEGEN_PATH
+#if defined(PSPRECOMP_TESTS_NO_SUBPROCESS)
+    report_skipped_subprocess_test(__func__);
+#elif !defined(PSPRECOMP_CODEGEN_PATH)
     throw std::runtime_error("PSPRECOMP_CODEGEN_PATH was not provided by CMake");
 #else
     const auto root = std::filesystem::temp_directory_path() / "psprecomp_vh2f_codegen_test";
@@ -638,7 +655,9 @@ static void test_vfpu_branch_cfg_discovery() {
 }
 
 static void test_automatic_cfg_and_codegen() {
-#ifndef PSPRECOMP_CODEGEN_PATH
+#if defined(PSPRECOMP_TESTS_NO_SUBPROCESS)
+    report_skipped_subprocess_test(__func__);
+#elif !defined(PSPRECOMP_CODEGEN_PATH)
     throw std::runtime_error("PSPRECOMP_CODEGEN_PATH was not provided by CMake");
 #else
     const auto bytes = make_branch_delay_test_elf();
@@ -696,7 +715,9 @@ static void test_automatic_cfg_and_codegen() {
 }
 
 static void test_automatic_cross_unit_tail_chaining() {
-#ifndef PSPRECOMP_CODEGEN_PATH
+#if defined(PSPRECOMP_TESTS_NO_SUBPROCESS)
+    report_skipped_subprocess_test(__func__);
+#elif !defined(PSPRECOMP_CODEGEN_PATH)
     throw std::runtime_error("PSPRECOMP_CODEGEN_PATH was not provided by CMake");
 #else
     const auto root = std::filesystem::temp_directory_path() / "psprecomp_cross_unit_tail_test";
@@ -799,7 +820,13 @@ static std::vector<std::uint8_t> make_relocation_test_prx() {
     return bytes;
 }
 
-int main() {
+// Embedding hosts (e.g. the Switch self-test .nro) rename the entry point and
+// call it from their own main().
+#ifndef PSPRECOMP_TESTS_ENTRY
+#define PSPRECOMP_TESTS_ENTRY main
+#endif
+
+int PSPRECOMP_TESTS_ENTRY() {
     try {
         test_import_return_context_guard();
         test_chained_call_context_guard();

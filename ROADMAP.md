@@ -62,6 +62,7 @@ pes6-switch/                     (fork de jessicanataliagta/PSPRecomp)
 ├── CLAUDE.md                    instrucciones para Claude Code
 ├── include/ src/ tools/ tests/  framework (tocar lo mínimo; cambios genéricos → PR upstream)
 ├── switch/hello/                Fase 1: homebrew mínimo de prueba (framebuffer + pad + nxlink)
+├── switch/selftest/             tests del framework corriendo en la consola
 └── profiles/pes6/
     ├── CMakeLists.txt
     ├── README.md                cómo construir y qué archivos aporta el usuario
@@ -87,7 +88,7 @@ pes6-switch/                     (fork de jessicanataliagta/PSPRecomp)
 Cada fase tiene **tareas**, **criterio de terminado (DoD)** y **estimación** para una persona a tiempo parcial con ayuda de Claude Code.
 
 ### Fase 1 — Toolchain y "hola mundo" en Switch  *(1–3 días)*
-- [ ] Instalar devkitPro y compilar un ejemplo de `switch-examples` (gráficos con SDL2 + un framebuffer de libnx).
+- [x] Instalar devkitPro y compilar un ejemplo de `switch-examples` (gráficos con SDL2 + un framebuffer de libnx). *(ejemplo propio `switch/hello` con framebuffer de libnx; probado en la consola)*
 - [ ] Configurar `nxlink` y verificar logs (`printf` → terminal del Mac).
 - [x] Crear una plantilla CMake mínima con `-DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake`, `nx_generate_nacp`, `nx_create_nro`. *(`switch/hello/`; compila sin warnings en la imagen `devkitpro/devkita64` (GCC 15.2) → `pes6_hello.nro` de 207 KB)*
 - [x] Workflow de GitHub Actions que construya el `.nro` y lo suba como artifact. *(`.github/workflows/ci.yml`: job `switch-hello` + job `framework` en macOS/Linux; en verde desde `a359cb2`)*
@@ -99,6 +100,8 @@ Cada fase tiene **tareas**, **criterio de terminado (DoD)** y **estimación** pa
 - [ ] Arreglar lo que dependa de MSVC/Windows en el framework (no en `vcs`), manteniendo los cambios genéricos y aislados (candidatos a PR upstream).
 - [ ] Leer `docs/PROFILE_GUIDE.md`, `docs/SOURCE_PROVENANCE.md` y recorrer `profiles/vcs/host` para entender: bootstrap, `Runtime::register_hle()`, `register_function()`, `register_native_fast_path()`, backend GE por software.
 - [ ] Documentar en `progress/` un mapa de cómo fluye un frame en el perfil VCS (display list GE → rasterizador CPU → presentación).
+
+- [ ] (Extra) `switch/selftest`: `.nro` que corre los tests del framework en la consola (`PSPRECOMP_TESTS_NO_SUBPROCESS` omite los 7 tests que lanzan `psp_recomp`). Compila; falta probarlo en la Switch.
 
 **DoD:** framework compila y pasa tests en macOS; existe una nota que explica la arquitectura del perfil VCS.
 

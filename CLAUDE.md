@@ -31,6 +31,11 @@ ctest --test-dir out/framework --output-on-failure
 cmake -S switch/hello -B out/switch-hello -G Ninja -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake"
 cmake --build out/switch-hello
 nxlink -s out/switch-hello/pes6_hello.nro   # envía a la consola y queda escuchando stdout
+
+# Tests del framework en la consola (resultado en pantalla y por nxlink)
+cmake -S switch/selftest -B out/switch-selftest -G Ninja -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake"
+cmake --build out/switch-selftest
+nxlink -s out/switch-selftest/pes6_selftest.nro
 ```
 
 ## Notas del entorno
