@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Phase 1: standalone libnx homebrew -> .nro artifact.
+  switch-hello:
+    runs-on: ubuntu-latest
+    # Ships devkitA64, libnx, switch-cmake (nx_create_nro), switch-portlibs,
+    # host cmake and ninja. DEVKITPRO is set by the image.
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S switch/hello -B out/switch-hello -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake"
+
+      - name: Build
+        run: cmake --build out/switch-hello
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pes6_hello-nro
+          path: out/switch-hello/pes6_hello.nro
+          if-no-files-found: error
+          retention-days: 14
+
+  # Phase 2: the game-neutral framework must keep building off Windows.
+  framework:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Configure
+        run: >
+          cmake -S . -B out/framework -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DPSPRECOMP_PROFILE=""
+
+      - name: Build
+        run: cmake --build out/framework
+
+      - name: Test
+        run: ctest --test-dir out/framework --output-on-failure

@@ -50,3 +50,23 @@ SAVEDATA/
 # Python
 __pycache__/
 *.pyc
+
+# PES6 Switch port: public repo, so the AOT corpus generated from the user's
+# own EBOOT never gets published (unlike the checked-in VCS corpus).
+/profiles/pes6/generated/
+EBOOT.BIN
+*.PRX
+*.prx
+*.PBP
+*.key
+*.keys
+keys/
+
+# Switch build products
+*.nro
+*.nacp
+*.nso
+*.nsp
+
+# macOS
+.DS_Store
