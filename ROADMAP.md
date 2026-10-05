@@ -42,8 +42,8 @@ Si la Ruta A se abre en algún momento, saltar directo a la Fase 5 adaptando su 
 - [ ] (Opcional) `sys-clk` para pruebas de rendimiento con overclock.
 
 ### Juego (copia propia)
-- [ ] Dump propio de PES6 PSP (UMD o PSN). Anotar **serial, región y SHA-1** del ISO.
-- [ ] Obtener el `EBOOT.BIN` **desencriptado** (ELF/PRX). PSPRecomp deja la desencriptación fuera del framework. Opciones: la opción de PPSSPP para volcar el EBOOT desencriptado al arrancar el juego, o `allegrexrecomp decrypt` de sp00nznet con material de claves propio.
+- [x] Dump propio de PES6 PSP (UMD o PSN). Anotar **serial, región y SHA-1** del ISO. *(**ULES-00476** — Pro Evolution Soccer 6, Europa, DISC_VERSION 1.03, PSP_SYSTEM_VER 2.81; ISO 1 248 329 728 bytes, SHA-1 `e5adf0b1a8386a5a33a358c39e7aa76d6a7c54b6`)*
+- [ ] Obtener el `EBOOT.BIN` **desencriptado** *(el del ISO está cifrado — cabecera `~PSP`, 1 915 264 bytes; `BOOT.BIN` está vacío/ceros)* (ELF/PRX). PSPRecomp deja la desencriptación fuera del framework. Opciones: la opción de PPSSPP para volcar el EBOOT desencriptado al arrancar el juego, o `allegrexrecomp decrypt` de sp00nznet con material de claves propio.
 - [ ] Extraer el resto de `PSP_GAME/USRDIR` (assets) a una carpeta local ignorada por git.
 
 ### Entorno de desarrollo
