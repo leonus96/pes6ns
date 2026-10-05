@@ -120,6 +120,8 @@ Trabajar primero en macOS/Linux, donde depurar es barato. Usar PPSSPP como orác
 
 - [ ] **4a. Esqueleto:** crear `profiles/pes6/` según la guía; `CMakeLists.txt`; generar el corpus AOT con `psp_recomp` (o una herramienta propia del perfil si hace falta lowering específico); bootstrap de rutas (`PSP_DATA`, `USRDIR`).
   - DoD: el binario compila, enlaza y ejecuta hasta el primer `sceDisplaySetFrameBuf` en modo headless.
+  - *Estado:* perfil creado (opción B: HLE de VCS copiado y podado en `profiles/pes6/host/`), corpus AOT generado (117 unidades de 16 KiB, 73 226 entradas), `PES6Native` compila y enlaza en macOS y ejecuta código de PES6 hasta el primer import sin HLE (`sceKernelGetModuleIdByAddress`). Arreglados 2 bugs de `psp_recomp` (bucle infinito en JAL→import; JAL a destinos sin unidad).
+  - **Hallazgo:** cientos de JAL a `0x08D1xxxx–0x08FCxxxx`, fuera del EBOOT (zona BSS) → PES6 carga **código en tiempo de ejecución** (overlays, probablemente desde `over.afs`). Habrá que extraerlos y recompilarlos.
 - [ ] **4b. Primer frame:** completar HLE bloqueante (memoria, threads, IO, GE); presentar el framebuffer con SDL2 en escritorio.
   - DoD: se ven los logos de Konami / pantalla de título.
 - [ ] **4c. Menús e input:** `sceCtrl` mapeado a teclado/mando SDL; navegación de menús.
