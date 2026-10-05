@@ -492,7 +492,14 @@ void Runtime::register_hle(std::string library, std::uint32_t nid, HleFunction f
 bool Runtime::has_function(std::uint32_t address) const { return lookup_function(address) != nullptr; }
 std::size_t Runtime::function_count() const noexcept { return functions_.size(); }
 
-void Runtime::set_game_root(std::filesystem::path root) { game_root_ = std::filesystem::weakly_canonical(std::move(root)); }
+void Runtime::set_game_root(std::filesystem::path root) {
+    // Device-prefixed roots such as libnx's "sdmc:/switch" are not absolute to
+    // std::filesystem and canonicalization rejects them with EINVAL; fall back
+    // to a lexically normalized path when the host cannot canonicalize it.
+    std::error_code ec;
+    auto canonical = std::filesystem::weakly_canonical(root, ec);
+    game_root_ = ec ? root.lexically_normal() : std::move(canonical);
+}
 const std::filesystem::path &Runtime::game_root() const noexcept { return game_root_; }
 
 std::filesystem::path Runtime::translate_path(const std::string &psp_path) const {
