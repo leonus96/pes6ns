@@ -850,6 +850,20 @@ std::string direct_unit_chain_expression(
         std::to_string(unit) + "u>(ctx, &aot_mem)";
 }
 
+// A direct unit edge needs its destination bucket to have been emitted.
+// Fixed targets outside the analysed image (for example code a title loads
+// into its BSS at runtime) must go through the runtime dispatcher instead.
+bool has_generated_unit(std::uint32_t target, std::uint32_t executable_base,
+                        std::uint32_t unit_span_bytes,
+                        const std::map<std::uint32_t, std::uint16_t> *direct_entry_ids) {
+    if (unit_span_bytes == 0u || target < executable_base) return false;
+    if (direct_entry_ids == nullptr) return true;
+    const std::uint64_t start = executable_base +
+        static_cast<std::uint64_t>((target - executable_base) / unit_span_bytes) * unit_span_bytes;
+    const auto found = direct_entry_ids->lower_bound(static_cast<std::uint32_t>(start));
+    return found != direct_entry_ids->end() && found->first < start + unit_span_bytes;
+}
+
 void emit_target(std::ostringstream &body, std::uint32_t target,
                  const std::set<std::uint32_t> &labels, const char *indent,
                  std::uint32_t executable_base = 0u,
@@ -876,7 +890,7 @@ void emit_target(std::ostringstream &body, std::uint32_t target,
     // chain table and indexes the tiny unit table instead. A bucket containing
     // an import/HLE/host replacement is marked overridden at registration time
     // and invoke_chained_unit() falls back to the exact per-PC lookup there.
-    if (unit_span_bytes != 0u && target >= executable_base) {
+    if (has_generated_unit(target, executable_base, unit_span_bytes, direct_entry_ids)) {
         const std::uint32_t unit = (target - executable_base) / unit_span_bytes;
         body << indent << "(void)" << direct_unit_chain_expression(unit, target, direct_entry_ids)
              << "; return;\n";
@@ -1062,8 +1076,9 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                         }
                         // Otherwise run the callee inline and resume locally only
                         // if it came back to our return address.
-                        const bool direct_unit = function.unit_span_bytes != 0u &&
-                            target >= function.executable_base;
+                        const bool direct_unit = has_generated_unit(
+                            target, function.executable_base, function.unit_span_bytes,
+                            function.direct_entry_ids);
                         const std::uint32_t target_unit = direct_unit
                             ? (target - function.executable_base) / function.unit_span_bytes : 0u;
                         if (!direct_unit)
