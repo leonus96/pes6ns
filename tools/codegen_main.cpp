@@ -1056,7 +1056,9 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                         if (target_is_import) {
                             body << "    ctx.pc = " << psprecomp::hex32(target) << "u;\n"
                                  << "    return;\n";
-                            continue;
+                            // The block ends here. `continue` would re-emit this
+                            // same JAL forever without advancing pc.
+                            break;
                         }
                         // Otherwise run the callee inline and resume locally only
                         // if it came back to our return address.
