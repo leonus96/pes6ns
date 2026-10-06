@@ -9,6 +9,7 @@
 #include "pes6_runtime_log.hpp"
 #include "pes6_overlays.hpp"
 #include "atrac_decoder.hpp"
+#include "media_decoder.hpp"
 #include "audio_output.hpp"
 #include "display_window.hpp"
 #include "framebuffer_capture.hpp"
@@ -56,44 +57,6 @@ void set_runtime_post_import_hook(RuntimePostImportHook hook) noexcept;
 
 namespace pes6 {
 namespace {
-
-// ---------------------------------------------------------------------------
-// Media decoding stubs.
-//
-// The VCS host decoded PMF video with an in-process FFmpeg build
-// (vcs_media_decoder.*). These stand-ins keep the sceMpeg bookkeeping intact
-// while every open() fails, so AVC decodes report "no frame".  ATRAC has its
-// own frame decoder (atrac_decoder.hpp).
-// ---------------------------------------------------------------------------
-void log_media_stub_once(const char *what) {
-    static std::unordered_set<std::string> reported;
-    if (reported.insert(what).second)
-        std::cerr << "[media] " << what
-                  << " decoding is not available in this build (no FFmpeg); "
-                     "producing silence / no frame\n";
-}
-
-class PmfAudioDecoder {
-public:
-    [[nodiscard]] bool open(const std::filesystem::path &) {
-        log_media_stub_once("PMF audio");
-        return false;
-    }
-    [[nodiscard]] std::size_t read(std::span<std::uint8_t>) { return 0u; }
-    [[nodiscard]] bool is_open() const noexcept { return false; }
-    void close() noexcept {}
-};
-
-class VideoStreamDecoder {
-public:
-    [[nodiscard]] bool open(const std::filesystem::path &) {
-        log_media_stub_once("PMF/AVC video");
-        return false;
-    }
-    [[nodiscard]] std::size_t read(std::span<std::uint8_t>) { return 0u; }
-    [[nodiscard]] bool is_open() const noexcept { return false; }
-    void close() noexcept {}
-};
 
 struct DirectoryHandle {
     std::vector<std::filesystem::directory_entry> entries;
@@ -1415,6 +1378,10 @@ struct ControllerPulseConfig {
     std::uint8_t ly{128u};
     bool has_lx{};
     bool has_ly{};
+    // start/end are virtual microseconds instead of vblanks ("@...ms" in a
+    // route). Needed where nothing waits for vblank, e.g. during the intro
+    // movie, and the vblank counter stands still.
+    bool by_time{};
 };
 
 std::uint64_t parse_environment_u64(const char *name, std::uint64_t fallback = 0u) {
@@ -1427,6 +1394,8 @@ std::uint64_t parse_environment_u64(const char *name, std::uint64_t fallback = 0
 
 // PSPRECOMP_CTRL_ROUTE="BUTTONS@START[+LENGTH],..." adds any number of pulses
 // (LENGTH defaults to 8 vblanks) after the eight numbered PULSE variables.
+// "BUTTONS@STARTms[+LENGTH]" counts virtual milliseconds instead (LENGTH
+// defaults to 100 ms).
 void append_controller_route(std::vector<ControllerPulseConfig> &values) {
     const char *text = std::getenv("PSPRECOMP_CTRL_ROUTE");
     if (text == nullptr) return;
@@ -1442,9 +1411,13 @@ void append_controller_route(std::vector<ControllerPulseConfig> &values) {
         const std::size_t plus = item.find('+', at);
         ControllerPulseConfig value{};
         value.buttons = static_cast<std::uint32_t>(std::strtoull(item.substr(0, at).c_str(), nullptr, 0));
-        value.start_vblank = std::strtoull(item.substr(at + 1, plus == std::string::npos ? std::string::npos : plus - at - 1).c_str(), nullptr, 0);
-        const std::uint64_t length = plus == std::string::npos ? 8u : std::strtoull(item.substr(plus + 1).c_str(), nullptr, 0);
-        value.end_vblank = value.start_vblank + length;
+        const std::string start = item.substr(at + 1, plus == std::string::npos ? std::string::npos : plus - at - 1);
+        value.by_time = start.size() > 2u && start.compare(start.size() - 2u, 2u, "ms") == 0;
+        const std::uint64_t scale = value.by_time ? 1000u : 1u;
+        value.start_vblank = std::strtoull(start.c_str(), nullptr, 0) * scale;
+        const std::uint64_t length = plus == std::string::npos ? (value.by_time ? 100u : 8u)
+                                                               : std::strtoull(item.substr(plus + 1).c_str(), nullptr, 0);
+        value.end_vblank = value.start_vblank + length * scale;
         values.push_back(value);
     }
 }
@@ -1524,7 +1497,8 @@ void dump_ram_if_requested(const psprecomp::GuestMemory &memory) {
 }
 
 bool controller_pulse_active(const ControllerPulseConfig &pulse) {
-    return display_vblank_index >= pulse.start_vblank && display_vblank_index <= pulse.end_vblank &&
+    const std::uint64_t now = pulse.by_time ? virtual_time_us : display_vblank_index;
+    return now >= pulse.start_vblank && now <= pulse.end_vblank &&
            (pulse.buttons != 0u || pulse.has_lx || pulse.has_ly);
 }
 
@@ -2844,6 +2818,7 @@ void enqueue_continuation(std::int32_t uid, const psprecomp::AllegrexContext &co
 }
 
 bool activate_next_thread(psprecomp::AllegrexContext &ctx, const char *reason);
+void passive_scanout_if_due();
 bool start_due_alarm_thread();
 std::uint64_t earliest_alarm_due_us();
 
@@ -2942,6 +2917,7 @@ bool activate_next_thread(psprecomp::AllegrexContext &ctx, const char *reason) {
             (void)start_due_alarm_thread();
         }
     }
+    passive_scanout_if_due();
     if (thread_table.continuations.empty()) return false;
 
     // PSP priorities are inverted: a smaller numeric value means a higher
@@ -3613,6 +3589,12 @@ FrameTimeStats frame_time_stats;
 
 // Presentation census, reported at shutdown.
 std::uint64_t software_presents{};
+// Presents made by passive_scanout_if_due() (no thread waited for vblank).
+std::uint64_t passive_scanouts{};
+// Virtual vblank period (virtual time / period) last shown in the window.
+std::uint64_t last_present_tick = ~0ull;
+// Set by install_profile(); lets the scheduler scan out without an HLE call.
+psprecomp::Runtime *scanout_runtime{};
 
 // GE command words interpreted since the last vblank report.  list_us without
 // it cannot say whether display-list execution is slow per command or simply
@@ -4417,6 +4399,49 @@ bool ge_async_wait_idle(psprecomp::Runtime &runtime) {
     return ge_async_check_fatal(runtime);
 }
 
+// The PSP scans the display out every vblank whether or not a thread waits for
+// it, but this HLE presents (and captures, advances the audio mixer and paces
+// to wall-clock time) inside sceDisplayWaitVblank*.  PES6's movie player never
+// waits for vblank: its display thread flips with sceDisplaySetFrameBuf and
+// paces itself with sceKernelDelayThread, so the whole intro ran inside a single
+// vblank -- never shown, never heard, done in a second of wall time.
+//
+// Called from the scheduler: once a whole vblank period has passed with no
+// present, show the current framebuffer as the PSP would have.  The game's own
+// vblank waits keep their timing (display_vblank_index, which the scripted
+// routes count, only advances there); a passive present happens one period
+// late, so it never takes the place of a wait that is merely still to come.
+void passive_scanout_if_due() {
+    if (scanout_runtime == nullptr || last_present_tick == ~0ull) return;
+    const std::uint64_t tick = virtual_time_us / virtual_vblank_period_us();
+    if (tick < last_present_tick + 2u) return;
+    if (display_state.frame_buffer == 0u || display_state.width == 0u || display_state.height == 0u) return;
+    // Never block the scheduler on the GE worker; the next switch retries.
+    if (ge_async_enabled() && ge_async.started.load(std::memory_order_acquire) &&
+        ge_async.outstanding.load(std::memory_order_acquire) != 0u) return;
+    psprecomp::Runtime &rt = *scanout_runtime;
+    // Mark the previous period as shown: a vblank wait later in this one still
+    // presents, and the next passive present can come one period from now.
+    last_present_tick = tick - 1u;
+    ++passive_scanouts;
+    pes6::audio_output_advance(virtual_time_us);
+    const FramebufferDescription displayed{
+        display_state.frame_buffer,
+        display_state.width,
+        display_state.height,
+        display_state.buffer_width,
+        display_state.pixel_format,
+    };
+    capture_frame_if_requested(rt.memory(), displayed);
+    ge_gpu_backend_set_display_framebuffer(display_state.frame_buffer);
+    display_window_set_aspect_lock(
+        !movie_output_buffers.empty() &&
+        movie_output_buffers.count(normalize_ram_address(display_state.frame_buffer)) != 0u);
+    ++software_presents;
+    display_window_present(rt.memory(), displayed);
+    limit_frame_rate();
+}
+
 bool ge_async_wait_list(psprecomp::Runtime &runtime, std::uint32_t id) {
     if (!ge_async_enabled() || !ge_async.started.load(std::memory_order_acquire)) return true;
     const auto begin = std::chrono::steady_clock::now();
@@ -5095,12 +5120,25 @@ std::size_t flight_recorder_depth{};
 // one of those uids (wait/signal/refer/poll on semaphores or event flags).
 std::unordered_set<std::uint32_t> traced_kernel_objects;
 
+// PES6_TRACE_HLE_VBLANK=V: log every HLE call made while the vblank counter
+// reads V (at most 20000), e.g. to see what a thread does when nothing waits
+// for vblank.
+std::uint64_t trace_hle_vblank{};
+
 void flight_recorder_observer(psprecomp::Runtime &, std::string_view library, std::uint32_t nid,
                               std::int32_t thread_uid, std::uint32_t a0, std::uint32_t a1, std::uint32_t result) {
     if (!traced_kernel_objects.empty() && library == "ThreadManForUser" && traced_kernel_objects.contains(a0))
         std::cerr << "[sema-trace] v=" << display_vblank_index << " uid=" << thread_uid << " nid="
                   << psprecomp::hex32(nid) << " obj=" << psprecomp::hex32(a0) << " a1=" << psprecomp::hex32(a1)
                   << " -> " << psprecomp::hex32(result) << "\n";
+    if (trace_hle_vblank != 0u && display_vblank_index == trace_hle_vblank) {
+        static std::uint32_t traced = 0u;
+        if (traced++ < 20000u)
+            std::cerr << "[hle-trace] v=" << display_vblank_index << " t=" << virtual_time_us
+                      << " uid=" << thread_uid << " " << library << ":" << psprecomp::hex32(nid)
+                      << " a0=" << psprecomp::hex32(a0) << " a1=" << psprecomp::hex32(a1)
+                      << " -> " << psprecomp::hex32(result) << "\n";
+    }
     if (flight_recorder_depth == 0u) return;
     auto &entries = flight_recorder[thread_uid];
     if (entries.size() >= flight_recorder_depth) entries.pop_front();
@@ -5119,7 +5157,8 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
             if (end == cursor && *end != '\0') break;
         }
     }
-    if (flight_recorder_depth != 0u || !traced_kernel_objects.empty())
+    trace_hle_vblank = parse_environment_u64("PES6_TRACE_HLE_VBLANK", 0u);
+    if (flight_recorder_depth != 0u || !traced_kernel_objects.empty() || trace_hle_vblank != 0u)
         psprecomp::set_runtime_import_observer(&flight_recorder_observer);
     install_auto_dialogs(runtime);
     open_disc_image(runtime.game_root());
@@ -5450,12 +5489,15 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
 
     // --- Movie skip (PES6-specific) ------------------------------------------------
     // 0x088217C4 is the EBOOT's blocking "play PSMF movie" routine (title.ovl
-    // calls it with disc0:/PSP_GAME/USRDIR/pes6.pmf). Until sceMpeg decodes
-    // AVC/ATRAC, return at once as if the movie had finished.
-    // PES6_SKIP_MOVIES=0 plays them through the (stubbed) sceMpeg HLE instead.
+    // calls it with disc0:/PSP_GAME/USRDIR/pes6.pmf, the only movie on the
+    // disc). With FFmpeg the intro plays through the sceMpeg HLE; without it
+    // the player would wait forever for a picture, so the routine returns at
+    // once as if the movie had finished. PES6_SKIP_MOVIES=1 skips it anyway
+    // (the scripted routes do), PES6_SKIP_MOVIES=0 forces playback.
     static const bool skip_movies = [] {
         const char *text = std::getenv("PES6_SKIP_MOVIES");
-        return text == nullptr || std::string(text) != "0";
+        if (text == nullptr || *text == '\0') return !movie_decoding_available();
+        return std::string(text) != "0";
     }();
     if (skip_movies) {
         runtime.register_function(0x088217C4u,
@@ -5476,6 +5518,9 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
 }
 
 void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start) {
+    scanout_runtime = &runtime;
+    last_present_tick = ~0ull;
+    passive_scanouts = 0u;
     std::cerr << "[frame-rate] virtual_display=" << virtual_display_refresh_hz() << " Hz\n";
     file_table = FileTable{};
     for (auto &[address, state] : mpeg_contexts) close_video_decoder(state);
@@ -7269,7 +7314,6 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         // ~110 presents/s and each present blocked until the compositor freed
         // a drawable -- up to a whole refresh on a 60 Hz display.  The PSP
         // only scans out once per period anyway.
-        static std::uint64_t last_present_tick = ~0ull;
         const std::uint64_t present_tick = virtual_time_us / virtual_vblank_period_us();
         if (present_tick != last_present_tick) {
             last_present_tick = present_tick;
@@ -8588,6 +8632,17 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             set_success(ctx);
         });
 
+    // sceMpegAvcDecodeFlush(mpeg): PES6 calls it when a button cuts the intro
+    // short.  The decoder here never holds a delayed picture (see
+    // sceMpegAvcDecodeStop), so there is nothing to drain; the stream is closed
+    // by the sceMpegFlushAllStream/sceMpegDelete that follow.
+    runtime.register_hle("sceMpeg", 0x4571CC64u,
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            if (mpeg_contexts.find(ctx.gpr[4]) == mpeg_contexts.end()) { ctx.set_gpr(2, 0x806101FEu); return; }
+            if (std::getenv("PSPRECOMP_MPEG_DIAG") != nullptr) std::cerr << "[mpeg] AVC decode flush\n";
+            set_success(ctx);
+        });
+
     runtime.register_hle("sceMpeg", 0xA780CF7Eu,
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
             const auto state = mpeg_contexts.find(ctx.gpr[4]);
@@ -8658,7 +8713,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             // The movie's own soundtrack. It lives in private_stream_1 packets
             // that no generic demuxer surfaces, so PmfAudioDecoder walks the
-            // container itself; see vcs_media_decoder.cpp. Silence remains the
+            // container itself; see media_decoder_ffmpeg.cpp. Silence remains the
             // fallback, because a mute intro beats a stalled one.
             MpegContextState &mpeg = state->second;
             // Reopen when the movie changes, not merely when nothing is open: a
@@ -8741,6 +8796,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             if (std::getenv("PSPRECOMP_MPEG_DIAG") != nullptr &&
                 (state->second.decoded_video_frames <= 3u || state->second.decoded_video_frames % 30u == 0u)) {
                 std::cerr << "[mpeg] decoded frame=" << state->second.decoded_video_frames
+                          << " v=" << display_vblank_index
+                          << " t_ms=" << virtual_time_us / 1000u
                           << " destination=" << psprecomp::hex32(destination)
                           << " stride=" << frame_width << " consume=" << consume << "\n";
             }
@@ -9399,6 +9456,15 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             const auto fd = file_table.next_fd++;
             file_table.files.emplace(fd, std::move(stream));
+            // PES6 opens its intro by name (disc0:/PSP_GAME/USRDIR/pes6.pmf),
+            // never through a directory listing. Registering it lets
+            // identify_pmf_source() map the PSMF header the game hands
+            // sceMpeg back to the host file the movie decoder reads.
+            if (std::string extension = native.extension().string(); extension.size() == 4u) {
+                std::transform(extension.begin(), extension.end(), extension.begin(),
+                               [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+                if (extension == ".PMF") (void)register_virtual_disc_file(native);
+            }
             if (file_object_diag) {
                 std::cerr << "[fileobj-hle] open-ok fd=" << fd << " path=\"" << path
                           << "\" native=\"" << native.string()
@@ -9655,6 +9721,7 @@ void report_present_stats() {
         ge_async_stop_worker();
     }
     std::cerr << "[present-census] software=" << software_presents
+              << " passive=" << passive_scanouts
               << " window_frames=" << display_window_presented_frames() << "\n";
     if (async_was_running) {
         std::cerr << "[ge-async-summary] submitted=" << async_submitted

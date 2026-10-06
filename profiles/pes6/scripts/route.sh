@@ -17,7 +17,9 @@ done
 route="$*"
 frames="$repo/profiles/pes6/analysis/frames"
 mkdir -p "$frames"; rm -f "$frames"/*
-PSPRECOMP_CTRL_ROUTE="${route// /,}" PSPRECOMP_FRAME_DUMP_INTERVAL="${DUMP_INTERVAL:-1}" \
+# The intro movie is skipped (PES6_SKIP_MOVIES=0 plays it): routes count
+# vblanks, and nothing waits for vblank while it plays.
+PES6_SKIP_MOVIES="${PES6_SKIP_MOVIES:-1}" PSPRECOMP_CTRL_ROUTE="${route// /,}" PSPRECOMP_FRAME_DUMP_INTERVAL="${DUMP_INTERVAL:-1}" \
 PSPRECOMP_FRAME_DUMP_DIR="$frames" PSPRECOMP_FRAME_DUMP_START="${DUMP_START:-$last}" \
 PSPRECOMP_FRAME_DUMP_LIMIT="${DUMP_LIMIT:-400}" PSPRECOMP_STOP_VBLANK="$stop" \
 PES6_RUN_SECONDS="${PES6_RUN_SECONDS:-600}" "$repo/profiles/pes6/scripts/run.sh"

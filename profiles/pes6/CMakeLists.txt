@@ -20,7 +20,7 @@ if(NOT MSVC)
 endif()
 
 file(GLOB PES6_HOST_SOURCES CONFIGURE_DEPENDS "${PES6_PROFILE_DIR}/host/*.cpp")
-list(FILTER PES6_HOST_SOURCES EXCLUDE REGEX "(display_window|audio_device|atrac_decoder)_[a-z]+\\.cpp$")
+list(FILTER PES6_HOST_SOURCES EXCLUDE REGEX "(display_window|audio_device|atrac_decoder|media_decoder)_[a-z]+\\.cpp$")
 
 # Display/input and audio backends: an SDL2 window and audio device when SDL2 is
 # available (desktop, and devkitPro's switch-sdl2), otherwise headless/silent.
@@ -58,6 +58,19 @@ else()
     message(STATUS "PES6: no FFmpeg, ATRAC music will be silent")
 endif()
 
+# PMF movies (the intro): additionally libavformat (MPEG-PS demuxer) and
+# libswscale (YUV -> RGBA).  Without them the intro is skipped.
+if(PES6_USE_FFMPEG AND PES6_FFMPEG_FOUND)
+    pkg_check_modules(PES6_FFMPEG_VIDEO IMPORTED_TARGET libavformat libswscale)
+endif()
+if(PES6_USE_FFMPEG AND PES6_FFMPEG_FOUND AND PES6_FFMPEG_VIDEO_FOUND)
+    list(APPEND PES6_HOST_SOURCES "${PES6_PROFILE_DIR}/host/media_decoder_ffmpeg.cpp")
+    message(STATUS "PES6: PMF movie decoding with FFmpeg")
+else()
+    list(APPEND PES6_HOST_SOURCES "${PES6_PROFILE_DIR}/host/media_decoder_null.cpp")
+    message(STATUS "PES6: no libavformat/libswscale, PMF movies are skipped")
+endif()
+
 add_executable(PES6Native ${PES6_HOST_SOURCES} ${PES6_GENERATED})
 target_include_directories(PES6Native PRIVATE
     "${PES6_PROFILE_DIR}/host"
@@ -68,6 +81,9 @@ if(PES6_USE_SDL2 AND SDL2_FOUND)
 endif()
 if(PES6_USE_FFMPEG AND PES6_FFMPEG_FOUND)
     target_link_libraries(PES6Native PRIVATE PkgConfig::PES6_FFMPEG)
+endif()
+if(PES6_USE_FFMPEG AND PES6_FFMPEG_FOUND AND PES6_FFMPEG_VIDEO_FOUND)
+    target_link_libraries(PES6Native PRIVATE PkgConfig::PES6_FFMPEG_VIDEO)
 endif()
 if(NOT NINTENDO_SWITCH)
     target_link_libraries(PES6Native PRIVATE ${CMAKE_DL_LIBS})
