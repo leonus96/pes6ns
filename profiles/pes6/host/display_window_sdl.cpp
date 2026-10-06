@@ -1,17 +1,29 @@
-// SDL2 display/input backend for desktop (and later Switch, via devkitPro's
-// switch-sdl2). Everything runs on the emulation thread, which is the process
+// SDL2 display/input backend for desktop and Switch (devkitPro's switch-sdl2). Everything runs on the emulation thread, which is the process
 // main thread: macOS requires window and event handling there, and presenting
 // synchronously from the sceDisplay HLE keeps the guest and window in step.
 //
 // PES6_HEADLESS=1 disables the window (automated runs).
 // PES6_WINDOW_SCALE=<n> sets the initial integer scale (default 2).
+// PES6_RENDERER=gl draws the GE on the GPU (ge_gpu_backend_gl.cpp) through an
+// OpenGL 3.3 core context instead of an SDL_Renderer; with PES6_HEADLESS=1
+// the window is created hidden so automated runs still render on the GPU.
 //
 // Keyboard: arrows = D-pad, X = cross, C = circle, Z = square, V = triangle,
 // Q/E = L/R, Enter = START, Space = SELECT, WASD = analog stick, Esc = quit.
 // Game controllers use the standard SDL layout (south button = cross).
+//
+// Switch: full screen (480x272 scaled to fit, bilinear; PES6_SCALE_FILTER=
+// nearest for sharp pixels) and input from libnx's PadState instead of SDL,
+// mapped by position like a PlayStation pad: B = cross, A = circle,
+// Y = square, X = triangle, L/R = L/R, + = START, - = SELECT, left stick =
+// analog. ZL/ZR are left free. Holding + and - together for a second quits.
 #include "display_window.hpp"
+#include "ge_gpu_backend.hpp"
 
 #include <SDL.h>
+#if defined(__SWITCH__)
+#include <switch.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -33,13 +45,23 @@ struct Window {
     bool close_requested{};
     SDL_Window *window{};
     SDL_Renderer *renderer{};
+    SDL_GLContext gl_context{};
     SDL_Texture *texture{};
     int texture_width{};
     int texture_height{};
     SDL_GameController *controller{};
     std::uint64_t presented{};
     std::string status;
+#if defined(__SWITCH__)
+    PadState pad{};
+    unsigned quit_hold{};
+#endif
 } g;
+
+#if defined(__SWITCH__)
+// Presents run at ~60 Hz, so this is about one second.
+constexpr unsigned kQuitHoldPolls = 60u;
+#endif
 
 void open_first_controller() {
     if (g.controller != nullptr) return;
@@ -55,6 +77,12 @@ void open_first_controller() {
 
 void pump_events() {
     if (!g.enabled) return;
+#if defined(__SWITCH__)
+    padUpdate(&g.pad);
+    constexpr u64 quit_combo = HidNpadButton_Plus | HidNpadButton_Minus;
+    g.quit_hold = (padGetButtons(&g.pad) & quit_combo) == quit_combo ? g.quit_hold + 1u : 0u;
+    if (g.quit_hold >= kQuitHoldPolls) g.close_requested = true;
+#endif
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         switch (event.type) {
@@ -85,6 +113,18 @@ void update_title() {
 
 void present_rgba(const void *pixels, int width, int height, int pitch) {
     if (!g.enabled) return;
+    if (g.gl_context != nullptr) {
+        int drawable_width = 0, drawable_height = 0;
+        SDL_GL_GetDrawableSize(g.window, &drawable_width, &drawable_height);
+        ge_gpu_backend_present_rgba(
+            std::span<const std::byte>(static_cast<const std::byte *>(pixels),
+                                       static_cast<std::size_t>(pitch) * static_cast<std::size_t>(height)),
+            static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), drawable_width, drawable_height);
+        SDL_GL_SwapWindow(g.window);
+        ++g.presented;
+        pump_events();
+        return;
+    }
     if (g.texture == nullptr || g.texture_width != width || g.texture_height != height) {
         if (g.texture != nullptr) SDL_DestroyTexture(g.texture);
         // SDL_PIXELFORMAT_ABGR8888 is R,G,B,A in memory on little-endian hosts.
@@ -172,23 +212,76 @@ std::uint8_t axis_to_psp(int value) {
     return static_cast<std::uint8_t>(std::clamp((value + 32768) / 256, 0, 255));
 }
 
+#if defined(__SWITCH__)
+std::uint32_t switch_pad_buttons() {
+    const u64 held = padGetButtons(&g.pad);
+    std::uint32_t buttons = 0u;
+    const auto map = [&](u64 mask, std::uint32_t bit) { if (held & mask) buttons |= bit; };
+    map(HidNpadButton_Up, kUp);
+    map(HidNpadButton_Down, kDown);
+    map(HidNpadButton_Left, kLeft);
+    map(HidNpadButton_Right, kRight);
+    map(HidNpadButton_B, kCross);
+    map(HidNpadButton_A, kCircle);
+    map(HidNpadButton_Y, kSquare);
+    map(HidNpadButton_X, kTriangle);
+    map(HidNpadButton_L, kLTrigger);
+    map(HidNpadButton_R, kRTrigger);
+    map(HidNpadButton_Plus, kStart);
+    map(HidNpadButton_Minus, kSelect);
+    return buttons;
+}
+#endif
+
 } // namespace
 
 bool display_window_enabled() { return g.enabled; }
 
+bool gl_renderer_requested() {
+    const char *text = std::getenv("PES6_RENDERER");
+    return text != nullptr && std::string(text) == "gl";
+}
+
+// Core 3.3 context + GE backend on `window`. Returns false (and leaves no
+// context behind) when either fails.
+bool start_gl(bool vsync) {
+    g.gl_context = SDL_GL_CreateContext(g.window);
+    if (g.gl_context == nullptr) {
+        std::cerr << "[window] OpenGL context: " << SDL_GetError() << "\n";
+        return false;
+    }
+    SDL_GL_MakeCurrent(g.window, g.gl_context);
+    SDL_GL_SetSwapInterval(vsync ? 1 : 0);
+    std::string error;
+    if (!initialize_ge_gpu_backend(error)) {
+        std::cerr << "[window] GL GE backend: " << error << "\n";
+        SDL_GL_DeleteContext(g.gl_context);
+        g.gl_context = nullptr;
+        return false;
+    }
+    return true;
+}
+
 void display_window_start() {
-    if (const char *headless = std::getenv("PES6_HEADLESS"); headless != nullptr && *headless != '\0' &&
-                                                              std::string(headless) != "0")
-        return;
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
+    const char *headless_text = std::getenv("PES6_HEADLESS");
+    const bool headless = headless_text != nullptr && *headless_text != '\0' && std::string(headless_text) != "0";
+    const bool want_gl = gl_renderer_requested();
+    if (headless && !want_gl) return;
+#if defined(__SWITCH__)
+    // Input comes from libnx's pad, not SDL's joystick layer.
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    padInitializeDefault(&g.pad);
+    constexpr Uint32 subsystems = SDL_INIT_VIDEO;
+#else
+    const Uint32 subsystems = headless ? SDL_INIT_VIDEO : SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER;
+#endif
+    if (SDL_Init(subsystems) != 0) {
         std::cerr << "[window] SDL_Init failed: " << SDL_GetError() << " (continuing headless)\n";
         return;
     }
     int scale = 2;
     if (const char *text = std::getenv("PES6_WINDOW_SCALE"); text != nullptr && *text != '\0')
         scale = std::clamp(std::atoi(text), 1, 8);
-    g.window = SDL_CreateWindow("PES6 Native", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                480 * scale, 272 * scale, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     // No vsync by default: the HLE frame limiter already paces presents at the
     // PSP's 59.94 Hz, and a present that also waits for the display (the Metal
     // renderer did, without asking: up to a full 60 Hz refresh per frame)
@@ -196,22 +289,67 @@ void display_window_start() {
     // speed and the audio starved.  PES6_VSYNC=1 restores it.
     const char *vsync_text = std::getenv("PES6_VSYNC");
     const bool vsync = vsync_text != nullptr && *vsync_text != '\0' && std::string(vsync_text) != "0";
-    SDL_SetHint(SDL_HINT_RENDER_VSYNC, vsync ? "1" : "0");
-    if (g.window != nullptr)
-        g.renderer = SDL_CreateRenderer(g.window, -1,
-                                        SDL_RENDERER_ACCELERATED | (vsync ? SDL_RENDERER_PRESENTVSYNC : 0u));
-    if (g.window == nullptr || g.renderer == nullptr) {
-        std::cerr << "[window] could not create window/renderer: " << SDL_GetError() << " (continuing headless)\n";
+
+    // At most two attempts: the GL window, then (if GL fails) a plain one.
+    for (bool gl_attempt : {want_gl, false}) {
+        Uint32 flags = headless ? SDL_WINDOW_HIDDEN : 0u;
+        if (gl_attempt) {
+            flags |= SDL_WINDOW_OPENGL;
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+            SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+            SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+        }
+#if defined(__SWITCH__)
+        // The window is the whole screen; the frame is letterboxed into it.
+        (void)scale;
+        g.window = SDL_CreateWindow("PES6 Native", 0, 0, 1280, 720, flags);
+#else
+        g.window = SDL_CreateWindow("PES6 Native", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 480 * scale,
+                                    272 * scale, flags | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+#endif
+        if (g.window == nullptr) break;
+        if (!gl_attempt || start_gl(vsync)) break;
+        // GL failed: fall back to the SDL_Renderer window (or to no window).
+        SDL_DestroyWindow(g.window);
+        g.window = nullptr;
+        if (headless) break;
+    }
+    if (g.window == nullptr) {
+        std::cerr << "[window] could not create window: " << SDL_GetError() << " (continuing headless)\n";
         display_window_shutdown();
         return;
     }
-    SDL_RenderSetVSync(g.renderer, vsync ? 1 : 0);
+    if (headless) return;  // GPU rendering only: no presents, no input
+
+    if (g.gl_context == nullptr) {
+        SDL_SetHint(SDL_HINT_RENDER_VSYNC, vsync ? "1" : "0");
+        g.renderer = SDL_CreateRenderer(g.window, -1,
+                                        SDL_RENDERER_ACCELERATED | (vsync ? SDL_RENDERER_PRESENTVSYNC : 0u));
+        if (g.renderer == nullptr) {
+            std::cerr << "[window] could not create renderer: " << SDL_GetError() << " (continuing headless)\n";
+            display_window_shutdown();
+            return;
+        }
+        SDL_RenderSetVSync(g.renderer, vsync ? 1 : 0);
+    }
+#if defined(__SWITCH__)
+    // 480x272 -> 1280x720 is a non-integer 2.65x: bilinear by default.
+    const char *filter = std::getenv("PES6_SCALE_FILTER");
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,
+                filter != nullptr && std::string(filter) == "nearest" ? "nearest" : "linear");
+#else
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
+#endif
     g.enabled = true;
     open_first_controller();
-    SDL_SetRenderDrawColor(g.renderer, 0, 0, 0, 255);
-    SDL_RenderClear(g.renderer);
-    SDL_RenderPresent(g.renderer);
+    if (g.renderer != nullptr) {
+        SDL_SetRenderDrawColor(g.renderer, 0, 0, 0, 255);
+        SDL_RenderClear(g.renderer);
+        SDL_RenderPresent(g.renderer);
+    }
     update_title();
     pump_events();
 }
@@ -226,6 +364,17 @@ void display_window_set_aspect_lock(bool) noexcept {}
 
 void display_window_present(const psprecomp::GuestMemory &memory, const FramebufferDescription &description) {
     if (!g.enabled) { ++g.presented; return; }
+    if (g.gl_context != nullptr) {
+        // The GE drew this framebuffer on the GPU: show that image.
+        int drawable_width = 0, drawable_height = 0;
+        SDL_GL_GetDrawableSize(g.window, &drawable_width, &drawable_height);
+        if (ge_gpu_backend_present_framebuffer(description.address, drawable_width, drawable_height)) {
+            SDL_GL_SwapWindow(g.window);
+            ++g.presented;
+            pump_events();
+            return;
+        }
+    }
     // The guest waits for vblank before its first sceDisplaySetFrameBuf.
     const std::uint32_t bytes_per_pixel = description.pixel_format == 3u ? 4u : 2u;
     if (description.address == 0u || description.width == 0u || description.height == 0u ||
@@ -247,6 +396,9 @@ void display_window_present_rgba(std::span<const std::byte> rgba, std::uint32_t 
 
 std::uint32_t display_window_buttons() {
     if (!g.enabled) return 0u;
+#if defined(__SWITCH__)
+    return switch_pad_buttons();
+#endif
     if (!(SDL_GetWindowFlags(g.window) & SDL_WINDOW_INPUT_FOCUS)) return controller_buttons();
     return keyboard_buttons() | controller_buttons();
 }
@@ -261,6 +413,13 @@ HostInputState display_window_input() {
     HostInputState state{};
     if (!g.enabled) return state;
     state.buttons = display_window_buttons();
+#if defined(__SWITCH__)
+    // libnx sticks are -32767..32767 with +y up; the PSP's y grows downward.
+    const HidAnalogStickState stick = padGetStickPos(&g.pad, 0);
+    state.analog_x = axis_to_psp(stick.x);
+    state.analog_y = axis_to_psp(-stick.y);
+    return state;
+#endif
     if (g.controller != nullptr) {
         state.analog_x = axis_to_psp(SDL_GameControllerGetAxis(g.controller, SDL_CONTROLLER_AXIS_LEFTX));
         state.analog_y = axis_to_psp(SDL_GameControllerGetAxis(g.controller, SDL_CONTROLLER_AXIS_LEFTY));
@@ -283,6 +442,10 @@ void display_window_shutdown() {
     if (g.controller != nullptr) SDL_GameControllerClose(g.controller);
     if (g.texture != nullptr) SDL_DestroyTexture(g.texture);
     if (g.renderer != nullptr) SDL_DestroyRenderer(g.renderer);
+    if (g.gl_context != nullptr) {
+        shutdown_ge_gpu_backend();
+        SDL_GL_DeleteContext(g.gl_context);
+    }
     if (g.window != nullptr) SDL_DestroyWindow(g.window);
     if (g.window != nullptr || g.enabled) SDL_Quit();
     g = Window{};

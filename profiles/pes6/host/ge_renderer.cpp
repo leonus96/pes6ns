@@ -1,5 +1,6 @@
 #include "ge_renderer.hpp"
 #include "ge_gpu_backend.hpp"
+#include "host_platform.hpp"
 
 #include "psprecomp/common.hpp"
 
@@ -8,6 +9,7 @@
 #include <bit>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -17,9 +19,11 @@
 #include <functional>
 #include <type_traits>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
@@ -421,7 +425,9 @@ private:
 
     RowWorkerPool() {
         unsigned requested = std::thread::hardware_concurrency();
-        if (requested == 0u) requested = 1u;
+        // 0 on Switch (libstdc++ without a CPU count): the caller plus one
+        // pinned worker per remaining core.
+        if (requested == 0u) requested = static_cast<unsigned>(platform_worker_cores().size()) + 1u;
         bool explicitly_configured = false;
         if (const char *text = std::getenv("PSPRECOMP_RASTER_THREADS")) {
             char *end = nullptr;
@@ -444,7 +450,11 @@ private:
         if (worker_count_ <= 1u) return;
         workers_.reserve(worker_count_ - 1u);
         for (unsigned index = 1u; index < worker_count_; ++index)
-            workers_.emplace_back([this, index] { worker_loop(index); });
+            workers_.emplace_back([this, index] {
+                if (const auto &cores = platform_worker_cores(); !cores.empty())
+                    platform_pin_current_thread(cores[(index - 1u) % cores.size()]);
+                worker_loop(index);
+            });
     }
 
     ~RowWorkerPool() {
@@ -1916,8 +1926,16 @@ bool software_raster_skipped(const std::array<std::uint32_t, 256> &commands) noe
         const char *value = std::getenv("PSPRECOMP_GE_GPU_SKIP_DISPLAYED_RASTER");
         return value == nullptr || (*value != '\0' && *value != '0');
     }();
+    // PSPRECOMP_GE_GPU_KEEP_SOFTWARE=1 rasterizes GPU-owned surfaces on the
+    // CPU as well, so VRAM keeps the software reference image to compare with
+    // (PSPRECOMP_FRAME_DUMP_BOTH).
+    static const bool keep_software = [] {
+        const char *value = std::getenv("PSPRECOMP_GE_GPU_KEEP_SOFTWARE");
+        return value != nullptr && *value != '\0' && *value != '0';
+    }();
     if (!ge_gpu_backend_active()) return false;
     if (skip_everything) return true;
+    if (!keep_software && ge_gpu_backend_owns_framebuffer(framebuffer_address(commands))) return true;
     const std::uint32_t target = framebuffer_address(commands) & 0x001FFFF0u;
     if (skip_owned) {
         const std::uint32_t owned = ge_gpu_backend_owned_framebuffer();
@@ -4092,6 +4110,38 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
     if (ge_phase_diag_enabled()) {
         ++g_ge_primitive_count;
         g_ge_vertex_count += count;
+    }
+
+    // PSPRECOMP_GE_TARGET_CENSUS: which surfaces the game draws into and which
+    // textures it samples out of VRAM (render-to-texture), printed at exit.
+    // Sizes the work a GPU backend has to do to keep VRAM-visible results.
+    static const bool target_census = std::getenv("PSPRECOMP_GE_TARGET_CENSUS") != nullptr;
+    if (target_census) {
+        struct Census {
+            std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, std::uint64_t> targets;
+            std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, std::uint64_t> vram_textures;
+            std::mutex mutex;
+            ~Census() {
+                std::fprintf(stderr, "[ge-target-census] draws per (fb, stride, format):\n");
+                for (const auto &[key, count] : targets)
+                    std::fprintf(stderr, "  fb=0x%08X stride=%u fmt=%u draws=%llu\n", std::get<0>(key),
+                                 std::get<1>(key), std::get<2>(key), static_cast<unsigned long long>(count));
+                std::fprintf(stderr, "[ge-target-census] textured draws sampling VRAM (tex, bufw, fmt, into fb):\n");
+                for (const auto &[key, count] : vram_textures)
+                    std::fprintf(stderr, "  tex=0x%08X bufw=%u fmt=%u fb=0x%08X draws=%llu\n", std::get<0>(key),
+                                 std::get<1>(key), std::get<2>(key), std::get<3>(key),
+                                 static_cast<unsigned long long>(count));
+            }
+        };
+        static Census census;
+        const std::uint32_t fb = framebuffer_address(commands);
+        std::lock_guard lock(census.mutex);
+        ++census.targets[{fb, data24(commands[0x9Du]) & 0x7FCu, data24(commands[0xD2u]) & 3u}];
+        const bool textured = (data24(commands[0x1Eu]) & 1u) != 0u && (data24(commands[0xD3u]) & 1u) == 0u;
+        const std::uint32_t texture = texture_address(commands, 0u);
+        if (textured && (texture & 0x0F000000u) == 0x04000000u)
+            ++census.vram_textures[{texture, data24(commands[0xA8u]) & 0x7FFu,
+                                    data24(commands[0xC3u]) & 0xFu, fb}];
     }
 
     const bool gpu_backend_enabled = ge_gpu_backend_active();

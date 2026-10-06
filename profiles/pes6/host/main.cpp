@@ -8,6 +8,7 @@
 #include "psprecomp/sha256.hpp"
 #include "audio_output.hpp"
 #include "display_window.hpp"
+#include "host_platform.hpp"
 #include "pes6_bootstrap_paths.hpp"
 #include "pes6_hle.hpp"
 #include "pes6_overlays.hpp"
@@ -43,10 +44,6 @@ std::uint64_t configured_max_dispatches() {
     return static_cast<std::uint64_t>(parsed);
 }
 
-std::filesystem::path native_executable_directory(const char *argv0) {
-    return std::filesystem::absolute(argv0 != nullptr ? argv0 : "PES6Native").parent_path();
-}
-
 std::uint32_t user_arena_start_after(const psprecomp::Elf32Image &elf) {
     std::uint64_t image_end = 0u;
     for (std::size_t index = 0; index < elf.segments().size(); ++index) {
@@ -64,9 +61,13 @@ std::uint32_t user_arena_start_after(const psprecomp::Elf32Image &elf) {
 } // namespace
 
 int main(int argc, char **argv) {
+    if (!pes6::platform_initialize()) {
+        pes6::platform_shutdown();
+        return 0;
+    }
     try {
         const std::filesystem::path executable_directory =
-            native_executable_directory(argc > 0 ? argv[0] : nullptr);
+            pes6::platform_default_data_directory(argc > 0 ? argv[0] : nullptr);
         const pes6::BootstrapPaths paths =
             pes6::resolve_bootstrap_paths(argc, argv, executable_directory);
         const std::filesystem::path &executable = paths.psp_executable;
@@ -152,9 +153,14 @@ int main(int argc, char **argv) {
         pes6::report_thread_state();
         pes6::audio_output_shutdown();
         pes6::display_window_shutdown();
+        pes6::platform_shutdown();
         return runtime.stop_reason().empty() ? 0 : 4;
     } catch (const std::exception &e) {
         std::cerr << "PES6Native error: " << e.what() << "\n";
+        pes6::audio_output_shutdown();
+        pes6::display_window_shutdown();
+        pes6::platform_show_fatal_error(e.what());
+        pes6::platform_shutdown();
         return 1;
     }
 }

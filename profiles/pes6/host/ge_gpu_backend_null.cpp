@@ -64,11 +64,18 @@ std::span<const std::byte> ge_gpu_backend_game_frame_rgba() noexcept { return {}
 bool ge_gpu_backend_copy_offscreen_rgba(std::span<std::byte>) noexcept { return false; }
 void ge_gpu_backend_mark_window_presented() noexcept {}
 GeGpuBackendReport ge_gpu_backend_report() { return state().report; }
+void ge_gpu_backend_attach_memory(const psprecomp::GuestMemory *) noexcept {}
+bool ge_gpu_backend_owns_framebuffer(std::uint32_t) noexcept { return false; }
+void ge_gpu_backend_invalidate_framebuffer(std::uint32_t, std::uint32_t) noexcept {}
+bool ge_gpu_backend_read_framebuffer_rgba(std::uint32_t, std::uint32_t, std::uint32_t, std::vector<std::byte> &) noexcept { return false; }
+bool ge_gpu_backend_present_framebuffer(std::uint32_t, int, int) noexcept { return false; }
+void ge_gpu_backend_present_rgba(std::span<const std::byte>, std::uint32_t, std::uint32_t, int, int) noexcept {}
 
 const char *ge_gpu_backend_name(GeGpuBackendKind kind) noexcept {
     switch (kind) {
     case GeGpuBackendKind::Software: return "software";
     case GeGpuBackendKind::DirectX12: return "directx12";
+    case GeGpuBackendKind::OpenGL: return "opengl";
     }
     return "unknown";
 }

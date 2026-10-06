@@ -34,7 +34,10 @@ BootstrapPaths resolve_bootstrap_paths(
         };
     }
 
-    constexpr std::array<const char *, 2> roots{"game", "PSP_DATA"};
+    // <dir>/game, <dir>/PSP_DATA, then <dir> itself (the Switch layout:
+    // everything directly in sdmc:/switch/pes6).
+    const std::array<std::filesystem::path, 3> roots{
+        executable_directory / "game", executable_directory / "PSP_DATA", executable_directory};
     constexpr std::array<const char *, 8> candidates{
         "EBOOT_DECRYPTED.BIN",
         "EBOOT_DECRYPTED.ELF",
@@ -46,8 +49,7 @@ BootstrapPaths resolve_bootstrap_paths(
         "PSP_GAME/SYSDIR/EBOOT.BIN",
     };
 
-    for (const char *root_name : roots) {
-        const std::filesystem::path root = executable_directory / root_name;
+    for (const std::filesystem::path &root : roots) {
         for (const char *relative : candidates) {
             const std::filesystem::path candidate = root / relative;
             std::error_code error;
@@ -56,10 +58,14 @@ BootstrapPaths resolve_bootstrap_paths(
         }
     }
 
+#if defined(__SWITCH__)
+    const std::filesystem::path &root = executable_directory;
+#else
     const std::filesystem::path root = executable_directory / "game";
+#endif
     std::ostringstream message;
     message << "No decrypted PES6 EBOOT was found.\n"
-            << "Place the decrypted executable and the extracted UMD contents at:\n  "
+            << "Place the decrypted executable, the ISO and the extracted UMD contents at:\n  "
             << root.string() << "\n"
             << "Recommended EBOOT path:\n  "
             << (root / "EBOOT_DECRYPTED.BIN").string() << "\n"

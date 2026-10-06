@@ -1,11 +1,14 @@
 #pragma once
 
 // GE GPU backend interface (data types + entry points the software renderer
-// and the HLE call). The PES6 host links only ge_gpu_backend_null.cpp, which
-// reports "software / not active", so every GPU path stays dormant. The types
-// are kept intact so a real backend (e.g. deko3d on Switch) can be added later.
-// Copied from the VCS profile; VCS-only entry points (widescreen HUD, cloud
-// camera) were removed.
+// and the HLE call). Two implementations:
+//   - ge_gpu_backend_gl.cpp: OpenGL 3.3 core (desktop and Switch), selected at
+//     run time with PES6_RENDERER=gl once the SDL window has a GL context;
+//   - ge_gpu_backend_null.cpp: "software / not active", for builds without
+//     SDL2, so every GPU path stays dormant.
+// Copied from the VCS profile (whose backend was DirectX 12); VCS-only entry
+// points (widescreen HUD, cloud camera) were removed and the PES6-specific
+// ones are at the end.
 
 #include <array>
 #include <cstddef>
@@ -14,11 +17,14 @@
 #include <string>
 #include <vector>
 
+namespace psprecomp { class GuestMemory; }
+
 namespace pes6 {
 
 enum class GeGpuBackendKind : std::uint8_t {
     Software,
     DirectX12,
+    OpenGL,
 };
 
 struct GeGpuDrawDescriptor {
@@ -567,5 +573,40 @@ void ge_gpu_backend_mark_window_presented() noexcept;
 
 [[nodiscard]] GeGpuBackendReport ge_gpu_backend_report();
 [[nodiscard]] const char *ge_gpu_backend_name(GeGpuBackendKind kind) noexcept;
+
+// --- PES6 (GL backend) ---------------------------------------------------
+// PES6 draws into exactly two framebuffers (the display double buffer) and
+// never samples a render target, so the GPU can own both outright: the CPU
+// rasterizer skips them, and guest VRAM is only the source of pixels the CPU
+// itself writes there (the intro movie).
+
+// Guest memory, for re-reading a framebuffer the CPU wrote into.
+void ge_gpu_backend_attach_memory(const psprecomp::GuestMemory *memory) noexcept;
+
+// True when the GPU holds the authoritative image of this framebuffer, so the
+// CPU rasterizer can leave it alone.
+[[nodiscard]] bool ge_gpu_backend_owns_framebuffer(std::uint32_t address) noexcept;
+
+// The CPU wrote [address, address + size) (movie frame, DMA copy). Every
+// framebuffer it overlaps is presented from guest VRAM until the GE draws into
+// it again, and that next draw starts from the VRAM content.
+void ge_gpu_backend_invalidate_framebuffer(std::uint32_t address, std::uint32_t size) noexcept;
+
+// GPU image of a framebuffer as width x height RGBA8, top row first (frame
+// dumps, GPU/CPU comparisons). False when the GPU does not own it.
+[[nodiscard]] bool ge_gpu_backend_read_framebuffer_rgba(
+    std::uint32_t address, std::uint32_t width, std::uint32_t height,
+    std::vector<std::byte> &rgba) noexcept;
+
+// Draws the GPU image of `address` into the window's default framebuffer,
+// letterboxed to drawable_width x drawable_height (the caller swaps). False
+// when the GPU does not own it; the caller then presents guest VRAM.
+[[nodiscard]] bool ge_gpu_backend_present_framebuffer(
+    std::uint32_t address, int drawable_width, int drawable_height) noexcept;
+
+// Same, for a CPU frame (tightly packed RGBA8, top row first).
+void ge_gpu_backend_present_rgba(std::span<const std::byte> rgba,
+                                 std::uint32_t width, std::uint32_t height,
+                                 int drawable_width, int drawable_height) noexcept;
 
 } // namespace pes6

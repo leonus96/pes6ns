@@ -153,15 +153,20 @@ Trabajar primero en macOS/Linux, donde depurar es barato. Usar PPSSPP como orác
 
 ### Fase 5 — Port a Switch  *(1–3 semanas)*
 Seguir el patrón de tres ramas que ya usa el proyecto: `_WIN32` / `__SWITCH__` / genérico.
-- [ ] Display: rama `__SWITCH__` con libnx `Framebuffer`/`NWindow` (blit del frame del rasterizador CPU, escalado y letterbox). Alternativa: SDL2 de devkitPro para compartir código con escritorio.
-- [ ] Input: `PadState` → misma estructura de input del host. ZL/ZR libres para funciones extra.
-- [ ] Audio: `audout` (48 kHz estéreo) con resampler y cola de buffers; respetar volumen por canal.
-- [ ] Rutas: datos del juego en `sdmc:/switch/pes6/` (EBOOT desencriptado + `USRDIR`); guardados en `sdmc:/switch/pes6/SAVEDATA/`. No usar romfs con assets del juego (no se distribuyen).
-- [ ] CMake: rama `NINTENDO_SWITCH` (link `nx`, `switch-ffmpeg` si aplica; `.nacp` con título/icono propios, no de Konami).
-- [ ] Memoria: verificar al iniciar si se está en modo applet y avisar en pantalla que se use title takeover.
-- [ ] CI: el workflow de la Fase 1 ahora construye `profiles/pes6` (sin datos del juego).
+- [x] Display: rama `__SWITCH__` con libnx `Framebuffer`/`NWindow` (blit del frame del rasterizador CPU, escalado y letterbox). Alternativa: SDL2 de devkitPro para compartir código con escritorio.
+  - *Probado en consola:* SDL2 de devkitPro con contexto OpenGL 4.3 core (Mesa/nouveau); el GE se dibuja en la GPU a 960×544 (`ge_gpu_backend_gl.cpp`) y se presenta con letterbox a 1280×720.
+- [x] Input: `PadState` → misma estructura de input del host. ZL/ZR libres para funciones extra.
+  - *Probado en consola (menús y partido):* `PadState` de libnx (no el joystick de SDL), por posición como un mando de PlayStation: B=✕, A=○, Y=□, X=△, L/R, +=START, −=SELECT, stick izquierdo. Mantener + y − un segundo sale.
+- [x] Audio: `audout` (48 kHz estéreo) con resampler y cola de buffers; respetar volumen por canal.
+  - *Probado en consola:* el mismo `audio_device_sdl.cpp` (SDL usa `audout` y convierte 44,1→48 kHz). En el partido va algo retrasado porque la emulación no llega a tiempo real (Fase 6).
+- [x] Rutas: datos del juego en `sdmc:/switch/pes6/` (EBOOT desencriptado + `USRDIR`); guardados en `sdmc:/switch/pes6/SAVEDATA/`. No usar romfs con assets del juego (no se distribuyen).
+  - *Probado en consola:* `sdmc:/switch/pes6/` con `EBOOT_DECRYPTED.BIN` y el `.iso`; no hace falta extraer `PSP_GAME`: los archivos del disco que faltan se sirven desde el ISO (la intro `pes6.pmf` se copia una vez a `cache/`). Guardados en `sdmc:/switch/pes6/PSP/SAVEDATA/` (misma estructura que la PSP). Registro en `pes6.log` (o por `nxlink -s`), variables en `pes6.env`.
+- [x] CMake: rama `NINTENDO_SWITCH` (link `nx`, `switch-ffmpeg` si aplica; `.nacp` con título/icono propios, no de Konami). *(`switch/pes6/`: `pes6.nro` de 170 MB, 0 warnings, FFmpeg estático sin `--start-group`; título "PES6 Switch (unofficial)", icono por defecto de libnx)*
+- [ ] Memoria: verificar al iniciar si se está en modo applet y avisar en pantalla que se use title takeover. *(implementado, sin probar)*
+- [x] CI: el workflow de la Fase 1 ahora construye `profiles/pes6` (sin datos del juego). *(job `switch-pes6-host`: `-DPES6_HOST_ONLY=ON` compila solo el host, porque `generated/` nunca está en el repo)*
 
 **DoD:** el `.nro` arranca en la consola, llega al menú y se puede jugar un partido (aunque vaya lento).
+*Estado (2026-10-06):* arranca, intro, menús al 100 % y partido jugable al ~72 % de velocidad (tirones con muchos jugadores, audio algo retrasado). Falta jugar un partido completo hasta "Resultado" para cerrar el DoD; el aviso de modo applet no se probó.
 
 ### Fase 6 — Rendimiento  *(2–6 semanas)*
 - [ ] Medir FPS en portátil y dock con logs por nxlink (tiempo por frame: CPU guest vs rasterizado vs presentación).
@@ -169,6 +174,7 @@ Seguir el patrón de tres ramas que ya usa el proyecto: `_WIN32` / `__SWITCH__` 
 - [ ] Paralelizar el rasterizador por software (4 núcleos A57) y/o vectorizar con NEON.
 - [ ] Native fast paths (`register_native_fast_path`) para las funciones más calientes del juego.
 - [ ] Si no alcanza: **backend GE por GPU** con OpenGL ES 3 (Mesa de devkitPro) o deko3d. Permite resolución interna 2x–4x (720p portátil / 1080p dock).
+  - *En curso (adelantado por decisión del usuario tras la primera prueba en consola: el raster por CPU no da en el A57):* `ge_gpu_backend_gl.cpp`, OpenGL 3.3 core (mismo código en macOS y Switch), `PES6_RENDERER=gl`, `PES6_RENDER_SCALE`. En el Mac coincide con el software (diferencia media 2–4 niveles en menús y partido). Pendiente: prueba en consola.
 - [ ] Detectar modo dock/portátil (`appletGetOperationMode`) y ajustar resolución.
 
 **DoD:** 30 FPS estables en partido como mínimo; meta de 60 FPS.

@@ -520,10 +520,17 @@ std::size_t read_disc_image(VirtualDiscHandle &handle, std::span<std::uint8_t> o
     return read;
 }
 
-// ISO 9660 lookup of a disc path's first sector. sceIoGetstat reports it in
+struct DiscImageEntry {
+    std::uint32_t lbn{};
+    std::uint32_t size{};
+    bool directory{};
+};
+
+// ISO 9660 lookup of a disc path. sceIoGetstat reports its first sector in
 // st_private[0]; PES6 adds archive offsets to it and then reads the result
-// through disc0:/sce_lbn... paths.
-std::optional<std::uint32_t> disc_image_file_lbn(std::string path) {
+// through disc0:/sce_lbn... paths. Files that are not extracted next to the
+// ISO are also served from here (open, getstat).
+std::optional<DiscImageEntry> disc_image_file_entry(std::string path) {
     if (!disc_image.input.is_open()) return std::nullopt;
     if (const auto colon = path.find(':'); colon != std::string::npos) path.erase(0, colon + 1u);
     const auto read_sector = [](std::uint32_t lbn, std::vector<std::uint8_t> &out, std::uint32_t bytes) {
@@ -554,9 +561,12 @@ std::optional<std::uint32_t> disc_image_file_lbn(std::string path) {
         if (slash == std::string::npos) break;
         start = slash + 1u;
     }
-    if (parts.empty()) return extent;
+    if (parts.empty()) return DiscImageEntry{extent, length, true};
+    bool current_is_directory = true;
     for (const auto &part : parts) {
+        if (!current_is_directory) return std::nullopt;
         std::vector<std::uint8_t> directory;
+        bool is_directory = false;
         if (length == 0u || length > 64u * 1024u * 1024u || !read_sector(extent, directory, length)) return std::nullopt;
         bool found = false;
         for (std::uint32_t offset = 0; offset < length;) {
@@ -569,14 +579,50 @@ std::optional<std::uint32_t> disc_image_file_lbn(std::string path) {
             if (upper(name) == part) {
                 extent = le32(directory.data() + offset + 2u);
                 length = le32(directory.data() + offset + 10u);
+                is_directory = (directory[offset + 25u] & 0x02u) != 0u;
                 found = true;
                 break;
             }
             offset += record;
         }
         if (!found) return std::nullopt;
+        current_is_directory = is_directory;
     }
-    return extent;
+    return DiscImageEntry{extent, length, current_is_directory};
+}
+
+bool is_disc_path(const std::string &path) {
+    return path.rfind("disc0:", 0u) == 0u || path.rfind("umd0:", 0u) == 0u;
+}
+
+// The movie decoder reads PMF files by host path, so a movie that is only in
+// the ISO is copied once to <game root>/cache/. Returns nullopt for other files.
+std::optional<std::filesystem::path> extract_movie_from_disc_image(
+    const psprecomp::Runtime &runtime, const std::string &path, const DiscImageEntry &entry) {
+    std::string extension = std::filesystem::path(path).extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    if (extension != ".PMF") return std::nullopt;
+    const std::filesystem::path cached =
+        runtime.game_root() / "cache" / std::filesystem::path(path).filename();
+    std::error_code error;
+    if (std::filesystem::is_regular_file(cached, error) &&
+        std::filesystem::file_size(cached, error) == entry.size)
+        return cached;
+    std::filesystem::create_directories(cached.parent_path(), error);
+    std::ofstream output(cached, std::ios::binary | std::ios::trunc);
+    if (!output) return std::nullopt;
+    VirtualDiscHandle handle{static_cast<std::uint64_t>(entry.lbn) * kUmdSectorSize, entry.size, 0u};
+    std::vector<std::uint8_t> buffer(1u << 20u);
+    while (const std::size_t read = read_disc_image(handle, buffer))
+        output.write(reinterpret_cast<const char *>(buffer.data()), static_cast<std::streamsize>(read));
+    output.close();
+    if (!output || handle.position != entry.size) {
+        std::filesystem::remove(cached, error);
+        return std::nullopt;
+    }
+    std::cerr << "[umd] extracted " << path << " to " << cached.string() << "\n";
+    return cached;
 }
 
 std::size_t read_virtual_disc(VirtualDiscHandle &handle, std::span<std::uint8_t> output) {
@@ -1174,6 +1220,8 @@ struct GeAsyncWorkerState {
     std::chrono::steady_clock::duration wait_time{};
 };
 GeAsyncWorkerState ge_async{};
+// The runtime the scheduler presents and waits for the GE with.
+psprecomp::Runtime *scanout_runtime{};
 thread_local bool ge_async_worker_thread = false;
 
 bool ge_async_enabled() noexcept {
@@ -1181,7 +1229,8 @@ bool ge_async_enabled() noexcept {
         const char *value = std::getenv("PSPRECOMP_GE_ASYNC");
         return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
     }();
-    return enabled;
+    // The GL backend's context lives on the emulation thread.
+    return enabled && !ge_gpu_backend_active();
 }
 
 bool ge_async_running() noexcept {
@@ -2900,6 +2949,13 @@ bool activate_next_thread(psprecomp::AllegrexContext &ctx, const char *reason) {
                        }),
         thread_table.continuations.end());
     (void)start_due_alarm_thread();
+    // Nothing runnable while the GE worker still has lists: a thread may be
+    // waiting for their callbacks. Let it finish before skipping time ahead.
+    if (thread_table.continuations.empty() && scanout_runtime != nullptr && ge_async_running() &&
+        ge_async.outstanding.load(std::memory_order_acquire) != 0u) {
+        if (!ge_async_wait_idle(*scanout_runtime)) return false;
+        (void)start_due_alarm_thread();
+    }
     if (thread_table.continuations.empty()) {
         std::uint64_t earliest = UINT64_MAX;
         for (const auto &[uid, thread] : thread_table.threads) {
@@ -3379,6 +3435,14 @@ bool alarm_thread_busy{};
 bool alarm_thread_running_vblank{};
 std::int32_t alarm_thread_alarm_uid{};
 std::uint32_t alarm_gp{};
+// Asynchronous GE (PSPRECOMP_GE_ASYNC): finish/signal callbacks of lists the
+// worker completed. On the PSP they are interrupt handlers, so they run on the
+// interrupt thread as soon as any guest code checks in -- not on the thread
+// that enqueued the list, which PES6 puts to sleep on a semaphore that only
+// the finish callback signals (queuing them for it deadlocked the boot).
+std::deque<GuestCallbackInvocation> ge_interrupt_callbacks;
+std::uint32_t ge_callback_gp{};
+bool alarm_thread_running_ge{};
 // Sub-interrupt numbers of VBLANK handlers still to run for the current
 // vblank, in ascending order, and the last vblank (virtual time / period)
 // whose handlers were queued.
@@ -3394,6 +3458,7 @@ bool any_vblank_handler_enabled() {
 
 std::uint64_t earliest_alarm_due_us() {
     if (alarm_thread_busy) return UINT64_MAX;
+    if (!ge_interrupt_callbacks.empty()) return virtual_time_us;
     std::uint64_t earliest = UINT64_MAX;
     for (const auto &[uid, alarm] : alarms) earliest = std::min(earliest, alarm.due_us);
     if (!pending_vblank_handlers.empty()) earliest = std::min(earliest, virtual_time_us);
@@ -3438,6 +3503,19 @@ bool start_due_alarm_thread() {
         found->second.occurred = true;
         alarm_thread_running_vblank = true;
     }
+    std::uint32_t argument2 = 0u;
+    alarm_thread_running_ge = false;
+    if (handler == 0u && !ge_interrupt_callbacks.empty()) {
+        const GuestCallbackInvocation callback = ge_interrupt_callbacks.front();
+        ge_interrupt_callbacks.pop_front();
+        handler = callback.function;
+        argument0 = callback.a0;
+        argument1 = callback.a1;
+        argument2 = callback.a2;
+        gp = ge_callback_gp != 0u ? ge_callback_gp : alarm_gp;
+        alarm_thread_running_vblank = false;
+        alarm_thread_running_ge = true;
+    }
     auto due = alarms.end();
     if (handler == 0u) {
         for (auto it = alarms.begin(); it != alarms.end(); ++it) {
@@ -3464,6 +3542,7 @@ bool start_due_alarm_thread() {
     context.set_gpr(29, thread->second.stack_top - 0x40u);
     context.set_gpr(4, argument0);
     context.set_gpr(5, argument1);
+    context.set_gpr(6, argument2);
     context.set_gpr(31, 0x00000004u);
     context.pc = handler;
     alarm_thread_busy = true;
@@ -3471,6 +3550,9 @@ bool start_due_alarm_thread() {
     if (std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr) {
         if (alarm_thread_running_vblank)
             std::cerr << "[intr] vblank sub=" << argument0 << " handler=" << psprecomp::hex32(handler)
+                      << " t=" << virtual_time_us << "\n";
+        else if (alarm_thread_running_ge)
+            std::cerr << "[intr] ge callback handler=" << psprecomp::hex32(handler)
                       << " t=" << virtual_time_us << "\n";
         else
             std::cerr << "[alarm] fire uid=" << due->first << " handler=" << psprecomp::hex32(handler)
@@ -3594,7 +3676,6 @@ std::uint64_t passive_scanouts{};
 // Virtual vblank period (virtual time / period) last shown in the window.
 std::uint64_t last_present_tick = ~0ull;
 // Set by install_profile(); lets the scheduler scan out without an HLE call.
-psprecomp::Runtime *scanout_runtime{};
 
 // GE command words interpreted since the last vblank report.  list_us without
 // it cannot say whether display-list execution is slow per command or simply
@@ -4358,8 +4439,8 @@ void ge_async_drain_completions() {
     while (!ready.empty()) {
         GeAsyncCompletion completion = std::move(ready.front());
         ready.pop_front();
-        auto &pending = pending_guest_callbacks[completion.submitter_uid];
-        pending.insert(pending.end(), completion.callbacks.begin(), completion.callbacks.end());
+        for (const GuestCallbackInvocation &callback : completion.callbacks)
+            if (callback.function != 0u) ge_interrupt_callbacks.push_back(callback);
     }
 }
 
@@ -4432,6 +4513,7 @@ void passive_scanout_if_due() {
         display_state.buffer_width,
         display_state.pixel_format,
     };
+    (void)ge_gpu_backend_finish_color_frame(display_vblank_index);
     capture_frame_if_requested(rt.memory(), displayed);
     ge_gpu_backend_set_display_framebuffer(display_state.frame_buffer);
     display_window_set_aspect_lock(
@@ -4719,7 +4801,9 @@ bool continue_mpeg_ringbuffer_callback(psprecomp::Runtime &runtime,
 
 void pes6_interrupt_return(psprecomp::Runtime &runtime, psprecomp::AllegrexContext &ctx) {
     if (thread_table.current_uid == kAlarmThreadUid) {
-        if (alarm_thread_running_vblank) {
+        if (alarm_thread_running_ge) {
+            alarm_thread_running_ge = false;  // popped when it started
+        } else if (alarm_thread_running_vblank) {
             if (!pending_vblank_handlers.empty()) pending_vblank_handlers.pop_front();
         } else {
             const std::uint32_t rearm_us = ctx.gpr[2];
@@ -5165,6 +5249,8 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
     alarms.clear();
     alarm_thread_busy = false;
     alarm_thread_running_vblank = false;
+    alarm_thread_running_ge = false;
+    ge_interrupt_callbacks.clear();
     pending_vblank_handlers.clear();
     vblank_interrupt_tick = 0u;
     io_async_results.clear();
@@ -5283,6 +5369,7 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
             std::vector<std::uint8_t> bytes(size);
             rt.memory().copy_out(source, bytes);
             rt.memory().copy_in(destination, bytes);
+            ge_gpu_backend_invalidate_framebuffer(destination, size);
             set_success(ctx);
         });
 
@@ -5519,6 +5606,7 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
 
 void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start) {
     scanout_runtime = &runtime;
+    ge_gpu_backend_attach_memory(&runtime.memory());
     last_present_tick = ~0ull;
     passive_scanouts = 0u;
     std::cerr << "[frame-rate] virtual_display=" << virtual_display_refresh_hz() << " Hz\n";
@@ -6778,6 +6866,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 ctx.set_gpr(2, 0x800200D3u);  // SCE_KERNEL_ERROR_ILLEGAL_ADDR
                 return;
             }
+            ge_callback_gp = ctx.gpr[28];
             GeCallbackRecord record{
                 rt.memory().load32(callback_data + 0u),
                 rt.memory().load32(callback_data + 4u),
@@ -7186,6 +7275,58 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 const auto accounted_non_guest = ge_async_running()
                     ? present_us + io_us + ge_async_wait_us
                     : ge_us + present_us + io_us;
+                const std::int64_t cpu_us = ge_async_running()
+                    ? (frame_us > present_us + io_us ? frame_us - present_us - io_us : 0)
+                    : (frame_us > ge_us ? frame_us - ge_us : 0);
+                const std::int64_t guest_cpu_us =
+                    frame_us > accounted_non_guest ? frame_us - accounted_non_guest : 0;
+                // PSPRECOMP_FRAME_TIME_INTERVAL=N (N > 1): one [frame-time-avg]
+                // line per N vblanks instead of one line per vblank, for hosts
+                // where the log is slow storage (the Switch's SD card). The
+                // [ge-phase] line then also covers the whole window.
+                static const std::uint64_t frame_time_interval = std::max<std::uint64_t>(1u,
+                    parse_environment_u64("PSPRECOMP_FRAME_TIME_INTERVAL", 1u));
+                if (frame_time_interval > 1u) {
+                    struct Window {
+                        std::uint64_t vblanks{};
+                        std::int64_t frame{}, frame_max{}, ge{}, ge_wait{}, present{}, io{}, cpu{}, guest_cpu{};
+                        std::uint64_t guest{}, ge_calls{};
+                    };
+                    static Window window;
+                    ++window.vblanks;
+                    window.frame += frame_us;
+                    window.frame_max = std::max<std::int64_t>(window.frame_max, frame_us);
+                    window.ge += ge_us;
+                    window.ge_wait += ge_async_wait_us;
+                    window.present += present_us;
+                    window.io += io_us;
+                    window.cpu += cpu_us;
+                    window.guest_cpu += guest_cpu_us;
+                    window.guest += virtual_time_us - frame_time_stats.last_guest_time;
+                    window.ge_calls += frame_time_stats.ge_calls;
+                    if (window.vblanks >= frame_time_interval) {
+                        const auto n = static_cast<std::int64_t>(window.vblanks);
+                        std::ostringstream average_line;
+                        average_line << "[frame-time-avg] vblank=" << display_vblank_index
+                                     << " vblanks=" << n
+                                     << " frame_us=" << window.frame / n
+                                     << " frame_max_us=" << window.frame_max
+                                     << " ge_us=" << window.ge / n
+                                     << " ge_async_wait_us=" << window.ge_wait / n
+                                     << " present_us=" << window.present / n
+                                     << " io_us=" << window.io / n
+                                     << " cpu_us=" << window.cpu / n
+                                     << " guest_cpu_us=" << window.guest_cpu / n
+                                     << " guest_us=" << window.guest / window.vblanks
+                                     << " ge_calls=" << window.ge_calls / window.vblanks
+                                     << " fps=" << (window.frame > 0 ? 1000000 * n / window.frame : 0)
+                                     << " speed_percent=" << (window.frame > 0
+                                            ? static_cast<std::int64_t>(100u * window.guest) / window.frame : 0)
+                                     << "\n";
+                        write_diag_line(average_line);
+                        window = Window{};
+                    }
+                }
                 std::ostringstream frame_line;
                 frame_line << "[frame-time] vblank=" << display_vblank_index
                            << " frame_us=" << frame_us
@@ -7201,11 +7342,17 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                            << " guest_us=" << (virtual_time_us - frame_time_stats.last_guest_time)
                            << " ge_calls=" << frame_time_stats.ge_calls
                            << " fps=" << (frame_us > 0 ? 1000000 / frame_us : 0) << "\n";
-                write_diag_line(frame_line);
+                if (frame_time_interval <= 1u) write_diag_line(frame_line);
                 // Splits ge_us into the per-fragment pixel loop and everything
                 // else, which is per-triangle geometry.  Says directly which of
                 // the two a heavy frame is actually spent on.
-                if (ge_phase_diag_line_enabled()) {
+                static std::int64_t ge_phase_window_ge_us = 0;
+                static std::uint64_t ge_phase_window_vblanks = 0u;
+                ge_phase_window_ge_us += ge_us;
+                if (ge_phase_diag_line_enabled() && ++ge_phase_window_vblanks >= frame_time_interval) {
+                    const std::int64_t ge_us = ge_phase_window_ge_us;  // the whole window
+                    ge_phase_window_ge_us = 0;
+                    ge_phase_window_vblanks = 0u;
                     const pes6::GePhaseTotals phases = pes6::ge_phase_totals();
                     const std::int64_t pixel_us =
                         static_cast<std::int64_t>(phases.pixel_loop_ns / 1000u);
@@ -7295,6 +7442,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             display_state.buffer_width,
             display_state.pixel_format,
         };
+        // Submit the GE work of this period before the frame is dumped or shown.
+        (void)ge_gpu_backend_finish_color_frame(display_vblank_index);
         capture_frame_if_requested(rt.memory(), displayed);
         dump_ram_if_requested(rt.memory());
         ge_gpu_backend_set_display_framebuffer(display_state.frame_buffer);
@@ -8779,6 +8928,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 rt.memory().copy_in(destination + static_cast<std::uint32_t>(y * destination_stride),
                     std::span<const std::uint8_t>(frame.data() + y * source_stride, source_stride));
             }
+            ge_gpu_backend_invalidate_framebuffer(
+                destination, static_cast<std::uint32_t>(destination_stride * state->second.header.height));
             rt.memory().store32(status_pointer, 1u);
 
             const std::uint32_t total_frames = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(
@@ -9306,7 +9457,21 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             const bool directory = std::filesystem::is_directory(native, error);
             const bool regular = std::filesystem::is_regular_file(native, error);
             if (!directory && !regular) {
-                ctx.set_gpr(2, 0x80010002u); // ENOENT
+                // Not extracted on the host: the ISO's own entry, if any.
+                const auto entry = is_disc_path(path) ? disc_image_file_entry(path) : std::nullopt;
+                if (!entry) {
+                    ctx.set_gpr(2, 0x80010002u); // ENOENT
+                    return;
+                }
+                rt.memory().zero(stat_address, 0x58u);
+                // UMD files are read-only: r-x for all three classes.
+                rt.memory().store32(stat_address + 0x00u, (entry->directory ? 0x1000u : 0x2000u) | 0x016Du);
+                rt.memory().store32(stat_address + 0x04u, entry->directory ? 0x0010u : 0x0020u);
+                rt.memory().store32(stat_address + 0x08u, entry->directory ? 0u : entry->size);
+                rt.memory().store32(stat_address + 0x40u, entry->lbn);
+                if (runtime_log_enabled())
+                    runtime_log_line("[io] getstat \"" + path + "\" from ISO lbn=" + psprecomp::hex32(entry->lbn));
+                set_success(ctx);
                 return;
             }
             rt.memory().zero(stat_address, 0x58u);
@@ -9342,11 +9507,11 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 rt.memory().store16(base + 10u, static_cast<std::uint16_t>(parts.tm_sec));
             }
             // st_private[0]: first UMD sector of the file.
-            if (path.rfind("disc0:", 0u) == 0u || path.rfind("umd0:", 0u) == 0u) {
-                if (const auto lbn = disc_image_file_lbn(path)) {
-                    rt.memory().store32(stat_address + 0x40u, *lbn);
+            if (is_disc_path(path)) {
+                if (const auto entry = disc_image_file_entry(path)) {
+                    rt.memory().store32(stat_address + 0x40u, entry->lbn);
                     if (runtime_log_enabled())
-                        runtime_log_line("[io] getstat \"" + path + "\" lbn=" + psprecomp::hex32(*lbn));
+                        runtime_log_line("[io] getstat \"" + path + "\" lbn=" + psprecomp::hex32(entry->lbn));
                 }
             }
             set_success(ctx);
@@ -9437,6 +9602,28 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             if ((flags & 0x0001u) != 0u) mode |= std::ios::in;
             if ((flags & 0x0002u) != 0u) mode |= std::ios::out;
             std::fstream stream(native, mode);
+            if (!stream && (flags & 0x0002u) == 0u && is_disc_path(path)) {
+                // Not extracted on the host: read it from the ISO.
+                if (const auto entry = disc_image_file_entry(path); entry && !entry->directory) {
+                    if (const auto cached = extract_movie_from_disc_image(rt, path, *entry)) {
+                        stream.open(*cached, std::ios::binary | std::ios::in);
+                        if (stream) {
+                            const auto fd = file_table.next_fd++;
+                            file_table.files.emplace(fd, std::move(stream));
+                            (void)register_virtual_disc_file(*cached);
+                            ctx.set_gpr(2, static_cast<std::uint32_t>(fd));
+                            return;
+                        }
+                    } else {
+                        const auto fd = file_table.next_fd++;
+                        file_table.virtual_disc_handles.emplace(
+                            fd, VirtualDiscHandle{static_cast<std::uint64_t>(entry->lbn) * kUmdSectorSize,
+                                                  entry->size, 0u});
+                        ctx.set_gpr(2, static_cast<std::uint32_t>(fd));
+                        return;
+                    }
+                }
+            }
             if (!stream) {
                 if (std::getenv("PSPRECOMP_IO_DIAG") != nullptr) {
                     static std::unordered_set<std::string> reported_paths;

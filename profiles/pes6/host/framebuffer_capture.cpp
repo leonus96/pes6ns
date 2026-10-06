@@ -1,4 +1,5 @@
 #include "framebuffer_capture.hpp"
+#include "ge_gpu_backend.hpp"
 
 #include "psprecomp/common.hpp"
 
@@ -255,7 +256,25 @@ void capture_frame_if_requested(const psprecomp::GuestMemory &memory,
         description.stride == 0u) return;
 
     try {
-        std::vector<std::uint8_t> rgb = decode_framebuffer_rgb(memory, description);
+        // A framebuffer the GPU backend owns is stale in guest VRAM (the CPU
+        // rasterizer skips it): dump the GPU image. PSPRECOMP_FRAME_DUMP_BOTH
+        // also writes the VRAM decode next to it as frame_N.cpu.ppm, which is
+        // the software reference when PSPRECOMP_GE_GPU_KEEP_SOFTWARE=1.
+        static const bool dump_both = std::getenv("PSPRECOMP_FRAME_DUMP_BOTH") != nullptr;
+        std::vector<std::byte> gpu_rgba;
+        const bool from_gpu = ge_gpu_backend_read_framebuffer_rgba(
+            description.address, description.width, description.height, gpu_rgba);
+        std::vector<std::uint8_t> rgb;
+        if (from_gpu) {
+            rgb.resize(static_cast<std::size_t>(description.width) * description.height * 3u);
+            for (std::size_t pixel = 0u, out = 0u; pixel + 3u < gpu_rgba.size(); pixel += 4u) {
+                rgb[out++] = static_cast<std::uint8_t>(gpu_rgba[pixel]);
+                rgb[out++] = static_cast<std::uint8_t>(gpu_rgba[pixel + 1u]);
+                rgb[out++] = static_cast<std::uint8_t>(gpu_rgba[pixel + 2u]);
+            }
+        } else {
+            rgb = decode_framebuffer_rgb(memory, description);
+        }
         const std::uint64_t hash = frame_hash(rgb);
         if (!state.dump_duplicates && state.previous_hash && *state.previous_hash == hash) return;
         state.previous_hash = hash;
@@ -264,6 +283,11 @@ void capture_frame_if_requested(const psprecomp::GuestMemory &memory,
         filename << "frame_" << std::setw(6) << std::setfill('0') << state.vblank_index << ".ppm";
         const std::filesystem::path path = state.directory / filename.str();
         write_framebuffer_ppm(path, description, rgb);
+        if (from_gpu && dump_both) {
+            std::filesystem::path cpu_path = path;
+            cpu_path.replace_extension(".cpu.ppm");
+            write_framebuffer_ppm(cpu_path, description, decode_framebuffer_rgb(memory, description));
+        }
         ++state.dumped;
         std::cerr << "[frame] dump=" << path.string()
                   << " address=" << psprecomp::hex32(description.address)

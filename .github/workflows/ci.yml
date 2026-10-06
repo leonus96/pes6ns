@@ -38,6 +38,25 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Phase 5: the pes6 host (HLE, SDL2/libnx display and input, FFmpeg) must
+  # keep compiling for Switch. The generated corpus comes from the user's own
+  # EBOOT and is never in the repository, so only the host is built here.
+  switch-pes6-host:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S switch/pes6 -B out/switch-pes6 -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake"
+          -DPES6_HOST_ONLY=ON
+
+      - name: Build
+        run: cmake --build out/switch-pes6
+
   # Phase 2: the game-neutral framework must keep building off Windows.
   framework:
     strategy:

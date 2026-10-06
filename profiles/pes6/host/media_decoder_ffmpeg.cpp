@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
+#include <string>
 #include <vector>
 
 extern "C" {
@@ -48,7 +50,15 @@ struct DecodeCommon {
 
     [[nodiscard]] bool open_stream(const std::filesystem::path &path, AVMediaType type) {
         release();
-        if (avformat_open_input(&format, path.string().c_str(), nullptr, nullptr) < 0) return false;
+        // Through the file protocol explicitly: libnx paths ("sdmc:/...")
+        // otherwise read as a URL with an unknown "sdmc" protocol.
+        const std::string url = "file:" + path.string();
+        if (const int error = avformat_open_input(&format, url.c_str(), nullptr, nullptr); error < 0) {
+            char text[AV_ERROR_MAX_STRING_SIZE]{};
+            av_strerror(error, text, sizeof(text));
+            std::cerr << "[pmf] cannot open " << url << ": " << text << "\n";
+            return false;
+        }
         if (avformat_find_stream_info(format, nullptr) < 0) return false;
         const AVCodec *decoder = nullptr;
         stream_index = av_find_best_stream(format, type, -1, -1, &decoder, 0);
