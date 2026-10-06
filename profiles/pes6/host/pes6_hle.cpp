@@ -1348,6 +1348,7 @@ void restore_ge_list_context(const GeListRecord &record) {
     ++ge_draw_state_revision;
     ++ge_lighting_state_revision;
     ++ge_camera_state_revision;
+    note_ge_clut_load();
     ge_state.transform = record.saved_transform;
     ge_state.offset_address = record.saved_offset_address;
     ge_state.vertex_address = record.saved_vertex_address;
@@ -1432,6 +1433,26 @@ struct ControllerPulseConfig {
     // movie, and the vblank counter stands still.
     bool by_time{};
 };
+
+// Diagnostic switches read on scheduler/GE paths that run thousands of times
+// per vblank; getenv walks the whole environment block on every call. The
+// environment is final before emulation starts (host_platform sets defaults).
+bool trace_env_enabled() {
+    static const bool enabled = std::getenv("PSPRECOMP_TRACE") != nullptr;
+    return enabled;
+}
+bool sched_diag_env_enabled() {
+    static const bool enabled = std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr;
+    return enabled;
+}
+bool ge_diag_env_enabled() {
+    static const bool enabled = std::getenv("PSPRECOMP_GE_DIAG") != nullptr;
+    return enabled;
+}
+bool event_diag_env_enabled() {
+    static const bool enabled = std::getenv("PSPRECOMP_EVENT_DIAG") != nullptr;
+    return enabled;
+}
 
 std::uint64_t parse_environment_u64(const char *name, std::uint64_t fallback = 0u) {
     const char *text = std::getenv(name);
@@ -2263,9 +2284,9 @@ void sas_mix_into(psprecomp::Runtime &rt, std::uint32_t output, std::uint32_t fr
             l += wet_mix[frame * 2u];
             r += wet_mix[frame * 2u + 1u];
         }
-        rt.memory().store16(output + frame * 4u, static_cast<std::uint16_t>(
+        rt.memory().aot_store16(output + frame * 4u, static_cast<std::uint16_t>(
             static_cast<std::int16_t>(std::clamp<std::int64_t>(l, -32768, 32767))));
-        rt.memory().store16(output + frame * 4u + 2u, static_cast<std::uint16_t>(
+        rt.memory().aot_store16(output + frame * 4u + 2u, static_cast<std::uint16_t>(
             static_cast<std::int16_t>(std::clamp<std::int64_t>(r, -32768, 32767))));
     }
     // PSPRECOMP_SAS_DIAG: peak of each bus over ~1 s of grains.
@@ -2302,7 +2323,7 @@ void sas_mix_raw(psprecomp::Runtime &rt, std::uint32_t output, std::uint32_t fra
     const std::uint32_t send_right_base = output + frames * 6u;
     for (std::uint32_t frame = 0u; frame < frames; ++frame) {
         const auto store = [&](std::uint32_t base, std::int32_t value) {
-            rt.memory().store16(base + frame * 2u, static_cast<std::uint16_t>(
+            rt.memory().aot_store16(base + frame * 2u, static_cast<std::uint16_t>(
                 static_cast<std::int16_t>(std::clamp(value, -32768, 32767))));
         };
         store(left_base, dry_mix[frame * 2u]);
@@ -2902,7 +2923,7 @@ bool preempt_if_higher_priority(psprecomp::AllegrexContext &ctx, const char *rea
     psprecomp::AllegrexContext caller = ctx;
     caller.pc = ctx.gpr[31];
     enqueue_continuation(caller_uid, caller);
-    if (std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr || std::getenv("PSPRECOMP_TRACE") != nullptr) {
+    if (sched_diag_env_enabled() || trace_env_enabled()) {
         std::cerr << "[sched] preempt reason=" << reason
                   << " caller=" << caller_uid
                   << " caller_priority=" << thread_priority(caller_uid)
@@ -2990,7 +3011,7 @@ bool activate_next_thread(psprecomp::AllegrexContext &ctx, const char *reason) {
     ctx = continuation.context;
     psprecomp::set_runtime_thread_identity(continuation.uid, thread_name);
 
-    if (std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr || std::getenv("PSPRECOMP_TRACE") != nullptr) {
+    if (sched_diag_env_enabled() || trace_env_enabled()) {
         const auto pending = pending_guest_callbacks.find(continuation.uid);
         const auto frames = async_return_frames.find(continuation.uid);
         std::cerr << "[sched] reason=" << reason
@@ -3056,7 +3077,7 @@ bool delay_current_thread(psprecomp::Runtime &runtime, psprecomp::AllegrexContex
     current->second.suspended_context = suspended;
     current->second.delay_until_us = virtual_time_us + delay_microseconds;
     current->second.delay_sequence = thread_table.next_delay_sequence++;
-    if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+    if (trace_env_enabled()) {
         std::cerr << "[sched] delay uid=" << thread_table.current_uid
                   << " usec=" << delay_microseconds
                   << " resume=" << psprecomp::hex32(suspended.pc) << "\n";
@@ -3076,7 +3097,7 @@ bool suspend_current_thread(psprecomp::Runtime &runtime, psprecomp::AllegrexCont
         current->second.state = ThreadState::Sleeping;
         current->second.suspended_context = suspended;
     }
-    if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+    if (trace_env_enabled()) {
         const auto found = thread_table.threads.find(thread_table.current_uid);
         std::cerr << "[sched] block uid=" << thread_table.current_uid
                   << " name=" << (found != thread_table.threads.end() ? found->second.name : "unknown")
@@ -3252,6 +3273,7 @@ constexpr bool ge_command_affects_gpu_draw_descriptor(std::uint32_t command) noe
     }
 }
 constexpr std::uint32_t kGeCommandOrigin = 0x14u;
+constexpr std::uint32_t kGeCommandLoadClut = 0xC4u;
 
 [[maybe_unused]] constexpr std::uint8_t kGeSignalNone = 0x00u;
 constexpr std::uint8_t kGeSignalHandlerSuspend = 0x01u;
@@ -3375,7 +3397,7 @@ bool start_next_guest_callback(psprecomp::AllegrexContext &ctx, bool begin_chain
     ctx.set_gpr(6, invocation.a2);
     ctx.set_gpr(31, 0x00000004u);
     ctx.pc = invocation.function;
-    if (std::getenv("PSPRECOMP_GE_DIAG") != nullptr || std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr) {
+    if (ge_diag_env_enabled() || sched_diag_env_enabled()) {
         std::cerr << "[callback] start uid=" << uid
                   << " function=" << psprecomp::hex32(invocation.function)
                   << " a0=" << psprecomp::hex32(invocation.a0)
@@ -3405,7 +3427,7 @@ void queue_guest_callback_chain(psprecomp::AllegrexContext &ctx,
     if (callbacks.empty()) return;
     auto &pending = pending_guest_callbacks[thread_table.current_uid];
     pending.insert(pending.end(), callbacks.begin(), callbacks.end());
-    if (std::getenv("PSPRECOMP_GE_DIAG") != nullptr || std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr) {
+    if (ge_diag_env_enabled() || sched_diag_env_enabled()) {
         std::cerr << "[callback] queued uid=" << thread_table.current_uid
                   << " count=" << callbacks.size()
                   << " total=" << pending.size()
@@ -3547,7 +3569,7 @@ bool start_due_alarm_thread() {
     context.pc = handler;
     alarm_thread_busy = true;
     enqueue_continuation(kAlarmThreadUid, context);
-    if (std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr) {
+    if (sched_diag_env_enabled()) {
         if (alarm_thread_running_vblank)
             std::cerr << "[intr] vblank sub=" << argument0 << " handler=" << psprecomp::hex32(handler)
                       << " t=" << virtual_time_us << "\n";
@@ -3662,6 +3684,9 @@ struct FrameTimeStats {
     // recompiled MIPS execution -- the two are attacked in completely different
     // ways, so the split has to be visible.
     std::chrono::steady_clock::duration present_time{};
+    // GL backend flush at the frame boundary (finish_color_frame): the batched
+    // draws of the period go to the driver here. Not part of ge_time.
+    std::chrono::steady_clock::duration flush_time{};
     std::chrono::steady_clock::time_point last_vblank{};
     std::uint64_t ge_calls{};
     std::uint64_t last_guest_time{};
@@ -3980,6 +4005,8 @@ bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
             ++ge_draw_state_revision;
         if (op != previous_command && ge_command_affects_lighting(command))
             ++ge_lighting_state_revision;
+        // CLOAD snapshots the palette even when the command word repeats.
+        if (command == kGeCommandLoadClut) note_ge_clut_load();
         // Camera matrices are streaming DATA registers: even an identical 24-bit
         // payload advances the cursor and can update a different matrix element.
         // View/projection cursor/data therefore always advance the camera
@@ -4866,7 +4893,7 @@ void pes6_interrupt_return(psprecomp::Runtime &runtime, psprecomp::AllegrexConte
     found->second.pop_back();
     if (found->second.empty()) async_return_frames.erase(found);
 
-    if (std::getenv("PSPRECOMP_GE_DIAG") != nullptr || std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr) {
+    if (ge_diag_env_enabled() || sched_diag_env_enabled()) {
         std::cerr << "[async-return] uid=" << uid
                   << " kind=" << (kind == AsyncReturnKind::GeCallbackChain ? "ge" : "subintr")
                   << " resume=" << psprecomp::hex32(ctx.pc) << "\n";
@@ -4891,7 +4918,7 @@ const char *thread_state_name(ThreadState state) {
 }
 
 bool event_diag_matches(const EventFlagRecord &flag) {
-    if (std::getenv("PSPRECOMP_EVENT_DIAG") == nullptr) return false;
+    if (!event_diag_env_enabled()) return false;
     const char *filter = std::getenv("PSPRECOMP_EVENT_DIAG_FILTER");
     return filter == nullptr || *filter == '\0' || flag.name.find(filter) != std::string::npos;
 }
@@ -5207,6 +5234,7 @@ std::unordered_set<std::uint32_t> traced_kernel_objects;
 // PES6_TRACE_HLE_VBLANK=V: log every HLE call made while the vblank counter
 // reads V (at most 20000), e.g. to see what a thread does when nothing waits
 // for vblank.
+std::uint64_t slow_hle_threshold_ns{};
 std::uint64_t trace_hle_vblank{};
 
 void flight_recorder_observer(psprecomp::Runtime &, std::string_view library, std::uint32_t nid,
@@ -5222,6 +5250,23 @@ void flight_recorder_observer(psprecomp::Runtime &, std::string_view library, st
                       << " uid=" << thread_uid << " " << library << ":" << psprecomp::hex32(nid)
                       << " a0=" << psprecomp::hex32(a0) << " a1=" << psprecomp::hex32(a1)
                       << " -> " << psprecomp::hex32(result) << "\n";
+    }
+    // PES6_SLOW_HLE_MS=N: host time between two import returns above N ms.
+    // Guest code in between advances virtual time, so a long gap with little
+    // virtual progress is the import that just returned (host-only stalls).
+    if (slow_hle_threshold_ns != 0u) {
+        static std::chrono::steady_clock::time_point last{};
+        static std::uint64_t last_guest_us{};
+        const auto now = std::chrono::steady_clock::now();
+        const auto gap = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count());
+        if (last != std::chrono::steady_clock::time_point{} && gap > slow_hle_threshold_ns)
+            std::cerr << "[slow-hle] v=" << display_vblank_index << " host_ms=" << gap / 1000000u
+                      << " guest_us=" << virtual_time_us - last_guest_us << " uid=" << thread_uid << " "
+                      << library << ":" << psprecomp::hex32(nid) << " a0=" << psprecomp::hex32(a0)
+                      << " a1=" << psprecomp::hex32(a1) << " -> " << psprecomp::hex32(result) << "\n";
+        last = now;
+        last_guest_us = virtual_time_us;
     }
     if (flight_recorder_depth == 0u) return;
     auto &entries = flight_recorder[thread_uid];
@@ -5242,7 +5287,9 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
         }
     }
     trace_hle_vblank = parse_environment_u64("PES6_TRACE_HLE_VBLANK", 0u);
-    if (flight_recorder_depth != 0u || !traced_kernel_objects.empty() || trace_hle_vblank != 0u)
+    slow_hle_threshold_ns = parse_environment_u64("PES6_SLOW_HLE_MS", 0u) * 1000000u;
+    if (flight_recorder_depth != 0u || !traced_kernel_objects.empty() || trace_hle_vblank != 0u ||
+        slow_hle_threshold_ns != 0u)
         psprecomp::set_runtime_import_observer(&flight_recorder_observer);
     install_auto_dialogs(runtime);
     open_disc_image(runtime.game_root());
@@ -5664,6 +5711,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     ++ge_draw_state_revision;
     ++ge_lighting_state_revision;
     ++ge_camera_state_revision;
+    note_ge_clut_load();
     reset_ge_transform_state(ge_state.transform);
     ge_list_table = GeListTable{};
     {
@@ -6176,7 +6224,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 current != thread_table.threads.end()) {
                 current->second.attributes |= attributes;
             }
-            if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+            if (trace_env_enabled()) {
                 std::cerr << "[hle] sceKernelChangeCurrentThreadAttr uid="
                           << thread_table.current_uid << " add=0x" << std::hex
                           << std::uppercase << attributes << std::dec << "\n";
@@ -6581,7 +6629,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             fixed_pool_table.pools.emplace(uid, FixedPoolRecord{name, address, block_size, block_count,
                 std::vector<bool>(block_count, false)});
             partition_table.next_address = address + reserved;
-            if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+            if (trace_env_enabled()) {
                 std::cerr << "[hle] sceKernelCreateFpl uid=" << uid << " name=" << name
                           << " block=0x" << std::hex << std::uppercase << block_size
                           << " count=" << std::dec << block_count << " base=0x"
@@ -7075,6 +7123,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             ++ge_draw_state_revision;
             ++ge_lighting_state_revision;
             ++ge_camera_state_revision;
+            note_ge_clut_load();
             ge_state.offset_address = ge_state.commands[kGeCommandOffsetAddress] << 8u;
             set_success(ctx);
         });
@@ -7266,6 +7315,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                     frame_time_stats.present_time).count();
                 const auto io_us = std::chrono::duration_cast<std::chrono::microseconds>(
                     io_host_time_this_vblank).count();
+                const auto flush_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    frame_time_stats.flush_time).count();
+                const GeTextureUploadTotals uploads = take_ge_texture_upload_totals();
                 const auto ge_async_wait_us = ge_async_running()
                     ? static_cast<std::int64_t>(ge_async.last_wait_ns.load(std::memory_order_acquire) / 1000u)
                     : 0;
@@ -7273,13 +7325,25 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 // execution, so subtracting it from wall time would under-report
                 // guest work.  Only the actual GE visibility wait is serialized.
                 const auto accounted_non_guest = ge_async_running()
-                    ? present_us + io_us + ge_async_wait_us
-                    : ge_us + present_us + io_us;
+                    ? present_us + io_us + flush_us + ge_async_wait_us
+                    : ge_us + present_us + io_us + flush_us;
                 const std::int64_t cpu_us = ge_async_running()
                     ? (frame_us > present_us + io_us ? frame_us - present_us - io_us : 0)
                     : (frame_us > ge_us ? frame_us - ge_us : 0);
                 const std::int64_t guest_cpu_us =
                     frame_us > accounted_non_guest ? frame_us - accounted_non_guest : 0;
+                // One line for any vblank that took far longer than a period:
+                // the stall the player sees (scene changes, loads).
+                if (frame_us > 150000) {
+                    std::ostringstream stall_line;
+                    stall_line << "[stall] vblank=" << display_vblank_index << " frame_us=" << frame_us
+                               << " ge_us=" << ge_us << " tex_uploads=" << uploads.uploads
+                               << " tex_upload_us=" << uploads.ns / 1000u << " flush_us=" << flush_us
+                               << " present_us=" << present_us << " io_us=" << io_us
+                               << " guest_cpu_us=" << guest_cpu_us
+                               << " guest_us=" << virtual_time_us - frame_time_stats.last_guest_time << "\n";
+                    write_diag_line(stall_line);
+                }
                 // PSPRECOMP_FRAME_TIME_INTERVAL=N (N > 1): one [frame-time-avg]
                 // line per N vblanks instead of one line per vblank, for hosts
                 // where the log is slow storage (the Switch's SD card). The
@@ -7290,7 +7354,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                     struct Window {
                         std::uint64_t vblanks{};
                         std::int64_t frame{}, frame_max{}, ge{}, ge_wait{}, present{}, io{}, cpu{}, guest_cpu{};
-                        std::uint64_t guest{}, ge_calls{};
+                        std::int64_t flush{};
+                        std::uint64_t guest{}, ge_calls{}, tex_uploads{}, tex_upload_ns{};
                     };
                     static Window window;
                     ++window.vblanks;
@@ -7299,6 +7364,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                     window.ge += ge_us;
                     window.ge_wait += ge_async_wait_us;
                     window.present += present_us;
+                    window.flush += flush_us;
+                    window.tex_uploads += uploads.uploads;
+                    window.tex_upload_ns += uploads.ns;
                     window.io += io_us;
                     window.cpu += cpu_us;
                     window.guest_cpu += guest_cpu_us;
@@ -7314,7 +7382,10 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                                      << " ge_us=" << window.ge / n
                                      << " ge_async_wait_us=" << window.ge_wait / n
                                      << " present_us=" << window.present / n
+                                     << " flush_us=" << window.flush / n
                                      << " io_us=" << window.io / n
+                                     << " tex_uploads=" << window.tex_uploads
+                                     << " tex_upload_ms=" << window.tex_upload_ns / 1000000u
                                      << " cpu_us=" << window.cpu / n
                                      << " guest_cpu_us=" << window.guest_cpu / n
                                      << " guest_us=" << window.guest / window.vblanks
@@ -7432,6 +7503,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             frame_time_stats.last_guest_time = virtual_time_us;
             frame_time_stats.ge_time = std::chrono::steady_clock::duration{};
             frame_time_stats.present_time = std::chrono::steady_clock::duration{};
+            frame_time_stats.flush_time = std::chrono::steady_clock::duration{};
             io_host_time_this_vblank = std::chrono::steady_clock::duration{};
             frame_time_stats.ge_calls = 0u;
         }
@@ -7443,7 +7515,13 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             display_state.pixel_format,
         };
         // Submit the GE work of this period before the frame is dumped or shown.
-        (void)ge_gpu_backend_finish_color_frame(display_vblank_index);
+        {
+            const auto flush_entry = frame_time_diag_enabled()
+                ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            (void)ge_gpu_backend_finish_color_frame(display_vblank_index);
+            if (frame_time_diag_enabled())
+                frame_time_stats.flush_time += std::chrono::steady_clock::now() - flush_entry;
+        }
         capture_frame_if_requested(rt.memory(), displayed);
         dump_ram_if_requested(rt.memory());
         ge_gpu_backend_set_display_framebuffer(display_state.frame_buffer);
@@ -7521,7 +7599,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             savedata_utility = SavedataUtilityState{UtilityStatus::Init, parameter, false};
             rt.memory().store32(parameter + kUtilityCommonResultOffset, 0u);
-            if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+            if (trace_env_enabled()) {
                 std::cerr << "[hle] savedata init mode=" << rt.memory().load32(parameter + kSavedataModeOffset)
                           << " game=" << read_fixed_string(rt.memory(), parameter + kSavedataGameNameOffset, 13u)
                           << " save=" << read_fixed_string(rt.memory(), parameter + kSavedataSaveNameOffset, 20u)
@@ -7551,7 +7629,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 }
                 savedata_utility.operation_complete = true;
                 savedata_utility.status = UtilityStatus::Quit;
-                if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+                if (trace_env_enabled()) {
                     std::cerr << "[hle] savedata operation result=0x" << std::hex << std::uppercase << result
                               << std::nouppercase << std::dec << "\n";
                 }
@@ -8915,12 +8993,27 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 ctx.set_gpr(2, 0x80610103u);
                 return;
             }
-            std::vector<std::uint8_t> frame(frame_bytes);
+            // With the frame-time diagnostic: one [mpeg-time] line per 60
+            // frames -- decode (FFmpeg + RGBA conversion), copy into guest
+            // RAM, and the wall time between frames (33 ms is real time).
+            struct MovieTiming {
+                std::uint64_t frames{}, decode_ns{}, copy_ns{}, interval_ns{}, guest_interval_us{};
+                std::uint64_t last_guest_us{};
+                std::chrono::steady_clock::time_point last{};
+            };
+            static MovieTiming movie_timing;
+            const bool time_movie = frame_time_diag_enabled();
+            const auto decode_start = time_movie ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
+            static thread_local std::vector<std::uint8_t> frame;
+            frame.resize(frame_bytes);
             if (!read_video_frame(state->second, frame)) {
                 rt.memory().store32(status_pointer, 0u);
                 ctx.set_gpr(2, 0x80628002u);
                 return;
             }
+            const auto copy_start = time_movie ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
             movie_output_buffers.insert(normalize_ram_address(destination));
             const std::size_t source_stride = static_cast<std::size_t>(state->second.header.width) * 4u;
             const std::size_t destination_stride = static_cast<std::size_t>(frame_width) * 4u;
@@ -8931,6 +9024,32 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             ge_gpu_backend_invalidate_framebuffer(
                 destination, static_cast<std::uint32_t>(destination_stride * state->second.header.height));
             rt.memory().store32(status_pointer, 1u);
+            if (time_movie) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto ns = [](auto duration) {
+                    return static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
+                };
+                if (movie_timing.frames != 0u) {
+                    movie_timing.interval_ns += ns(decode_start - movie_timing.last);
+                    movie_timing.guest_interval_us += virtual_time_us - movie_timing.last_guest_us;
+                }
+                movie_timing.last = decode_start;
+                movie_timing.last_guest_us = virtual_time_us;
+                movie_timing.decode_ns += ns(copy_start - decode_start);
+                movie_timing.copy_ns += ns(now - copy_start);
+                if (++movie_timing.frames % 60u == 0u) {
+                    std::ostringstream line;
+                    line << "[mpeg-time] frame=" << state->second.decoded_video_frames
+                         << " decode_us=" << movie_timing.decode_ns / 60000u
+                         << " copy_us=" << movie_timing.copy_ns / 60000u
+                         << " interval_us=" << movie_timing.interval_ns / 60000u
+                         << " guest_interval_us=" << movie_timing.guest_interval_us / 60u << "\n";
+                    write_diag_line(line);
+                    movie_timing.decode_ns = movie_timing.copy_ns = movie_timing.interval_ns = 0u;
+                    movie_timing.guest_interval_us = 0u;
+                }
+            }
 
             const std::uint32_t total_frames = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(
                 (state->second.header.last_timestamp - state->second.header.first_timestamp) / 3003u));
@@ -9232,7 +9351,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 set_success(ctx);
                 return;
             }
-            if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+            if (trace_env_enabled()) {
                 std::cerr << "[hle] unsupported sceIoDevctl device=" << device
                           << " cmd=0x" << std::hex << std::uppercase << command
                           << " in=0x" << input << "/" << std::dec << input_length

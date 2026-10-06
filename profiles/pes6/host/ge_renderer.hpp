@@ -108,6 +108,21 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
                          std::uint64_t lighting_state_revision = 0u,
                          bool collect_diagnostic_stats = true);
 
+// The GE copies the palette into its internal CLUT cache when CLOAD (0xC4)
+// executes; later draws read that copy, not guest memory. The list executor
+// calls this on every CLOAD (and on any context restore/reset), and the GPU path
+// re-hashes a palette only once per load instead of on every draw.
+void note_ge_clut_load() noexcept;
+
+// Textures decoded and uploaded to the GPU backend, and the host time that
+// took, since the previous call (which resets them). Always counted: uploads
+// are rare, and a burst of them at a scene change is a stall candidate.
+struct GeTextureUploadTotals {
+    std::uint64_t uploads{};
+    std::uint64_t ns{};
+};
+[[nodiscard]] GeTextureUploadTotals take_ge_texture_upload_totals() noexcept;
+
 // Time spent inside the per-fragment pixel loop, and the triangles that reached
 // it, since the last reset.  Only accumulated when PSPRECOMP_GE_PHASE_DIAG is
 // set.  The rest of ge_us is per-triangle geometry: clipping, viewport

@@ -6,9 +6,10 @@
 namespace pes6 {
 
 // Native audio device behind the virtual-time mixer in audio_output.cpp.
-// Implementations: audio_device_sdl.cpp (desktop, and devkitPro's switch-sdl2)
-// and audio_device_null.cpp (no device).  The mixer always produces 44.1 kHz
-// interleaved stereo s16 in fixed-size blocks.
+// Implementations: audio_device_sdl.cpp (desktop), audio_device_switch.cpp
+// (libnx audout) and audio_device_null.cpp (no device).  The mixer produces
+// interleaved stereo s16 in fixed-size blocks at
+// StreamingLinearResampler::kOutputRate (44.1 kHz; 48 kHz on Switch).
 
 // Whether a device should be used in this run (built in and not disabled, e.g.
 // by PES6_HEADLESS).  Decides, together with the WAV capture, whether the HLE

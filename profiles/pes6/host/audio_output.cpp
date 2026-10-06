@@ -1,9 +1,10 @@
 // Host audio sink for the sceAudio HLE: mixes every PSP channel on the guest's
-// virtual-time line and hands sealed 44.1 kHz stereo blocks to the native
+// virtual-time line and hands sealed stereo blocks (44.1 kHz; 48 kHz on
+// Switch, see StreamingLinearResampler::kOutputRate) to the native
 // device (audio_device.hpp) and, optionally, to a WAV capture.
 //
 // Mixing model (from the VCS profile's waveOut sink, minus the Windows device
-// handling): each submission is resampled to 44.1 kHz and added into a ring
+// handling): each submission is resampled to the output rate and added into a ring
 // at the output frame matching the virtual time at which the PSP would start
 // playing it.  A region is sealed (clamped to s16, queued, zeroed) from the
 // vblank path once virtual time is kMixSafetyFrames past it, so channels submitted a little apart still

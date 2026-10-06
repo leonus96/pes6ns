@@ -171,10 +171,12 @@ Seguir el patrón de tres ramas que ya usa el proyecto: `_WIN32` / `__SWITCH__` 
 ### Fase 6 — Rendimiento  *(2–6 semanas)*
 - [ ] Medir FPS en portátil y dock con logs por nxlink (tiempo por frame: CPU guest vs rasterizado vs presentación).
 - [ ] Compilar con `-O2/-O3`, LTO, `-mcpu=cortex-a57`; revisar hot paths del código generado.
+  - *Hecho:* Release (`-O3`) + `-mtune=cortex-a57` (toolchain) y `-fno-math-errno` (sin él, GCC llama a `lroundf`/`sqrtf` en la iluminación por vértice). LTO y código generado: pendiente.
 - [ ] Paralelizar el rasterizador por software (4 núcleos A57) y/o vectorizar con NEON.
 - [ ] Native fast paths (`register_native_fast_path`) para las funciones más calientes del juego.
 - [ ] Si no alcanza: **backend GE por GPU** con OpenGL ES 3 (Mesa de devkitPro) o deko3d. Permite resolución interna 2x–4x (720p portátil / 1080p dock).
-  - *En curso (adelantado por decisión del usuario tras la primera prueba en consola: el raster por CPU no da en el A57):* `ge_gpu_backend_gl.cpp`, OpenGL 3.3 core (mismo código en macOS y Switch), `PES6_RENDERER=gl`, `PES6_RENDER_SCALE`. En el Mac coincide con el software (diferencia media 2–4 niveles en menús y partido). Pendiente: prueba en consola.
+  - *Hecho (adelantado por decisión del usuario tras la primera prueba en consola: el raster por CPU no da en el A57):* `ge_gpu_backend_gl.cpp`, OpenGL 3.3 core (mismo código en macOS y Switch), `PES6_RENDERER=gl`, `PES6_RENDER_SCALE`. En el Mac coincide con el software (diferencia media 2–6 niveles en menús y partido). En consola: menús al 100 %, partido ~72 % (cuello de botella: la parte CPU del GE).
+  - *En curso (2026-10-06):* transformación, recorte, culling e iluminación direccional en el VS (`PSPRECOMP_GE_GPU_HW_*`, por defecto), CLUT por CLOAD y cachés por draw: GE en CPU −61 % en el Mac durante el partido (imagen idéntica a la ruta screen-space). Pendiente: medir en consola.
 - [ ] Detectar modo dock/portátil (`appletGetOperationMode`) y ajustar resolución.
 
 **DoD:** 30 FPS estables en partido como mínimo; meta de 60 FPS.

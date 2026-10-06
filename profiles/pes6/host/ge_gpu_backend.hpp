@@ -163,6 +163,17 @@ struct GeGpuHardwareTransform {
     std::uint32_t logical_prim_batches{1u};
     std::uint32_t unique_vertices_decoded{};
     std::uint32_t index_reuses{};
+    // PES6 GL: vertex lighting in the VS for the case the game uses -- only
+    // directional, diffuse-only lights and material colours that do not come
+    // from the vertex. Vertices then carry their model-space (skinned) normal
+    // and stay in model space; the VS applies the world matrix to the normal,
+    // sums the lights and quantizes to 8 bits as from_float_color() does.
+    bool vertex_lighting{};
+    bool reverse_normals{};
+    std::array<float, 12> world{};               // GE 4x3 world matrix
+    std::array<float, 4> light_base{};           // emissive + ambient terms, alpha
+    std::array<std::array<float, 4>, 4> light_direction{};  // xyz, w = enabled
+    std::array<std::array<float, 4>, 4> light_diffuse{};    // light x material diffuse
 };
 
 struct GeGpuVertex {
@@ -191,6 +202,10 @@ struct GeGpuVertex {
     // bit 0 = model-space/HW transform, bit 1 = culling enabled,
     // bit 2 = PSP accepts counter-clockwise faces, bit 3 = depth clip enabled.
     std::uint32_t transform_control{};
+    // Model-space normal after skinning, for GeGpuHardwareTransform::vertex_lighting.
+    float nx{};
+    float ny{};
+    float nz{1.0f};
 };
 
 struct GeGpuDecodedMipLevel {
@@ -509,6 +524,18 @@ void ge_gpu_backend_accumulate_hardware_triangles(
     const GeGpuHardwareTransform &transform,
     std::span<const GeGpuVertex> vertices,
     std::span<const std::uint32_t> triangle_indices) noexcept;
+
+// PES6 GL: assembles a PSP triangle list (3), strip (4) or fan (5) straight
+// into the backend's index stream, in the software path's vertex order.
+// `order` gives, per PSP vertex in draw order, its slot in `vertices` plus
+// `order_base`; empty means vertices are already in draw order.
+void ge_gpu_backend_accumulate_hardware_primitive(
+    const GeGpuDrawDescriptor &draw,
+    const GeGpuHardwareTransform &transform,
+    std::uint32_t primitive,
+    std::span<const GeGpuVertex> vertices,
+    std::span<const std::uint32_t> order,
+    std::uint32_t order_base) noexcept;
 
 // Stage 45.4 DX12 fast path for the dominant VCS world vertex format
 // (vtype 0x000115: u8 UV + 5551 colour + s16 XYZ, 10-byte stride).

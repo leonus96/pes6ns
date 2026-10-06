@@ -4,6 +4,7 @@
 #include "psprecomp/common.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -43,6 +44,11 @@ void drop_region(psprecomp::Runtime &runtime, std::uint32_t load_address) {
 }
 
 bool resolve_overlay_function(psprecomp::Runtime &runtime, std::uint32_t pc) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto elapsed_us = [&start] {
+        return std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start).count());
+    };
     for (std::size_t i = 0; i < kOverlayCount; ++i) {
         const OverlayDescriptor &overlay = kOverlays[i];
         if (pc < overlay.load_address + kHeaderSize || pc >= overlay.load_address + overlay.image_size) continue;
@@ -53,7 +59,8 @@ bool resolve_overlay_function(psprecomp::Runtime &runtime, std::uint32_t pc) {
         overlay.register_functions(runtime);
         active_overlays[overlay.load_address] = &overlay;
         runtime_log_line(std::string("[overlay] load ") + overlay.name + " at " +
-                         psprecomp::hex32(overlay.load_address) + " (entered at " + psprecomp::hex32(pc) + ")");
+                         psprecomp::hex32(overlay.load_address) + " (entered at " + psprecomp::hex32(pc) +
+                         ", " + elapsed_us() + " us)");
         return true;
     }
     // Report what is actually in memory so a missing or stale translation is

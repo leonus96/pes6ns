@@ -57,11 +57,17 @@ bool load(void *(*get_proc)(const char *), std::string &error) {
     PES6_GL_LOAD(DeleteBuffers);
     PES6_GL_LOAD(BindBuffer);
     PES6_GL_LOAD(BufferData);
+    PES6_GL_LOAD(BufferSubData);
     PES6_GL_LOAD(GenVertexArrays);
     PES6_GL_LOAD(DeleteVertexArrays);
     PES6_GL_LOAD(BindVertexArray);
     PES6_GL_LOAD(EnableVertexAttribArray);
     PES6_GL_LOAD(VertexAttribPointer);
+    PES6_GL_LOAD(VertexAttribIPointer);
+    PES6_GL_LOAD(TexBuffer);
+    PES6_GL_LOAD(GetIntegerv);
+    PES6_GL_LOAD(CullFace);
+    PES6_GL_LOAD(FrontFace);
     PES6_GL_LOAD(CreateShader);
     PES6_GL_LOAD(ShaderSource);
     PES6_GL_LOAD(CompileShader);
@@ -82,6 +88,7 @@ bool load(void *(*get_proc)(const char *), std::string &error) {
     PES6_GL_LOAD(Uniform4f);
     PES6_GL_LOAD(Uniform4i);
     PES6_GL_LOAD(DrawArrays);
+    PES6_GL_LOAD(DrawElements);
     PES6_GL_LOAD(Finish);
 #undef PES6_GL_LOAD
     if (ok) api = loaded;

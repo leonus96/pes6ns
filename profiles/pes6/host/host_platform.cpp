@@ -113,9 +113,10 @@ bool platform_initialize() {
     load_environment_file(std::filesystem::path(kDataDirectory) / "pes6.env");
     // Bring-up (Phase 5/6): a timing summary every 300 vblanks (~5 s) in the
     // log. Values from pes6.env win (setenv does not overwrite them).
+    // PSPRECOMP_GE_PHASE_DIAG=1 in pes6.env adds the per-phase GE breakdown
+    // ([ge-phase]); off by default, its clock reads cost 10-20 % of the GE.
     setenv("PSPRECOMP_FRAME_TIME_DIAG", "1", 0);
     setenv("PSPRECOMP_FRAME_TIME_INTERVAL", "300", 0);
-    setenv("PSPRECOMP_GE_PHASE_DIAG", "1", 0);
     // The GE runs on the GPU (OpenGL over Mesa); the CPU rasterizer is far too
     // slow on the A57. 2x internal resolution: 960x544, upscaled to 720p.
     // PES6_RENDERER=software and PES6_RENDER_SCALE=<n> in pes6.env override.

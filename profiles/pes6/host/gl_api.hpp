@@ -87,6 +87,7 @@ inline constexpr GLenum DEPTH_ATTACHMENT = 0x8D00;
 inline constexpr GLenum FRAMEBUFFER_COMPLETE = 0x8CD5;
 inline constexpr GLenum ARRAY_BUFFER = 0x8892;
 inline constexpr GLenum STREAM_DRAW = 0x88E0;
+inline constexpr GLenum DYNAMIC_DRAW = 0x88E8;
 inline constexpr GLenum VERTEX_SHADER = 0x8B31;
 inline constexpr GLenum FRAGMENT_SHADER = 0x8B30;
 inline constexpr GLenum COMPILE_STATUS = 0x8B81;
@@ -95,6 +96,16 @@ inline constexpr GLenum INFO_LOG_LENGTH = 0x8B84;
 inline constexpr GLenum VENDOR = 0x1F00;
 inline constexpr GLenum RENDERER = 0x1F01;
 inline constexpr GLenum VERSION = 0x1F02;
+inline constexpr GLenum TEXTURE1 = 0x84C1;
+inline constexpr GLenum TEXTURE_BUFFER = 0x8C2A;
+inline constexpr GLenum MAX_TEXTURE_BUFFER_SIZE = 0x8C2B;
+inline constexpr GLenum RGBA32F = 0x8814;
+inline constexpr GLenum ELEMENT_ARRAY_BUFFER = 0x8893;
+inline constexpr GLenum UNSIGNED_INT = 0x1405;
+inline constexpr GLenum CLIP_DISTANCE0 = 0x3000;
+inline constexpr GLenum CW = 0x0900;
+inline constexpr GLenum CCW = 0x0901;
+inline constexpr GLenum BACK = 0x0405;
 
 struct Api {
     const GLubyte *(*GetString)(GLenum){};
@@ -136,11 +147,17 @@ struct Api {
     void (*DeleteBuffers)(GLsizei, const GLuint *){};
     void (*BindBuffer)(GLenum, GLuint){};
     void (*BufferData)(GLenum, GLsizeiptr, const void *, GLenum){};
+    void (*BufferSubData)(GLenum, GLintptr, GLsizeiptr, const void *){};
     void (*GenVertexArrays)(GLsizei, GLuint *){};
     void (*DeleteVertexArrays)(GLsizei, const GLuint *){};
     void (*BindVertexArray)(GLuint){};
     void (*EnableVertexAttribArray)(GLuint){};
     void (*VertexAttribPointer)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void *){};
+    void (*VertexAttribIPointer)(GLuint, GLint, GLenum, GLsizei, const void *){};
+    void (*TexBuffer)(GLenum, GLenum, GLuint){};
+    void (*GetIntegerv)(GLenum, GLint *){};
+    void (*CullFace)(GLenum){};
+    void (*FrontFace)(GLenum){};
     GLuint (*CreateShader)(GLenum){};
     void (*ShaderSource)(GLuint, GLsizei, const GLchar *const *, const GLint *){};
     void (*CompileShader)(GLuint){};
@@ -161,6 +178,7 @@ struct Api {
     void (*Uniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat){};
     void (*Uniform4i)(GLint, GLint, GLint, GLint, GLint){};
     void (*DrawArrays)(GLenum, GLint, GLsizei){};
+    void (*DrawElements)(GLenum, GLsizei, GLenum, const void *){};
     void (*Finish)(){};
 };
 

@@ -159,6 +159,11 @@ std::uint64_t g_ge_triangle_prep_ns{};
 std::uint64_t g_ge_gpu_accumulate_ns{};
 std::uint64_t g_ge_primitive_count{};
 std::uint64_t g_ge_vertex_count{};
+// See take_ge_texture_upload_totals().
+std::uint64_t g_ge_texture_uploads{};
+std::uint64_t g_ge_texture_upload_total_ns{};
+// Bumped by note_ge_clut_load(); see clut_window_checksum().
+std::atomic<std::uint64_t> g_ge_clut_load_serial{1u};
 
 // Accumulates into `sink` only when the phase diagnostic is enabled, so the
 // production path pays one predictable branch and no clock read.
@@ -195,39 +200,31 @@ bool legacy_vertex_staging_enabled() noexcept {
 }
 
 
+// PES6 (GL backend): on by default. Projected triangles reach the GPU in
+// model space and the vertex shader does view/projection, viewport, fog and
+// clipping, so the CPU no longer clips and prepares screen triangles (a match:
+// GE time -61 % on the Mac together with the rest of the GL fast path, images
+// within 0.01 levels of the screen-space path). PSPRECOMP_GE_GPU_HW_TRANSFORM=0
+// restores the screen-space path for an A/B.
 bool gpu_hardware_transform_enabled() noexcept {
-    // Rendering.HardwareTransform decides; the environment variable still wins
-    // when set, so an A/B in one binary stays possible.
     static const bool enabled = [] {
         const char *text = std::getenv("PSPRECOMP_GE_GPU_HW_TRANSFORM");
-        // PES6: no INI configuration; only the environment variable opts in.
-        return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
+        return text == nullptr || (*text != '\0' && std::strcmp(text, "0") != 0);
     }();
     return enabled;
 }
 
-// Off by default: the GPU face-culling path drops whole models.
-//
-// It shipped enabled, but the hardware frontend only covered 5% of city
-// vertices, so the defect was almost invisible. Once the hybrid lit path took
-// coverage to 96.6%, large pieces of scenery disappeared -- confirmed by the
-// user, and confirmed fixed by setting this to 0 with everything else unchanged.
-//
-// The cause is NOT the world matrix handedness. That was tried and it is wrong
-// reasoning: the model-space path and the hybrid path apply exactly the same
-// total transform, only split differently between CPU and shader, so the
-// winding the GPU sees is identical in both. The bug is in this cull path
-// itself and is still unexplained.
-//
-// Culling on the CPU still happens for everything on the legacy path, and the
-// GPU simply rasterizes the back faces it is given -- a fill-rate cost on a
-// discrete GPU that measured well below the win from the hybrid transform.
-//
-// PSPRECOMP_GE_GPU_HW_CULL=1 re-enables it for whoever debugs it next.
+// GPU face culling for hardware-transform draws, on by default for PES6.
+// VCS turned it off because whole models vanished with its DX12 backend; the
+// GL backend derives the kept winding from the same edge_function() sign the
+// CPU culler uses (see ge_gpu_backend_accumulate_hardware_triangles), and a
+// match rendered with it matches the CPU-culled screen-space path. Without it
+// every back face would be rasterized and depth/blend tested.
+// PSPRECOMP_GE_GPU_HW_CULL=0 turns it off.
 bool gpu_hardware_cull_enabled() noexcept {
     static const bool enabled = [] {
         const char *text = std::getenv("PSPRECOMP_GE_GPU_HW_CULL");
-        return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
+        return text == nullptr || (*text != '\0' && std::strcmp(text, "0") != 0);
     }();
     return enabled;
 }
@@ -1368,6 +1365,36 @@ Color apply_lighting(Color input, bool has_vertex_color, Vec3 world_position,
                                    prepare_lighting(has_vertex_color, commands));
 }
 
+// Lighting registers normally stay unchanged for long runs of draws, and
+// decoding/normalizing all four PSP lights per PRIM (or, on the legacy path,
+// per vertex) was pure serial GE work. The profile supplies a monotonic
+// lighting-state revision, so reuse the prepared state until one of the actual
+// lighting/material registers changes. Revision 0 (tests, standalone callers)
+// keeps the exact uncached behaviour.
+PreparedLighting cached_prepared_lighting(bool has_vertex_color,
+                                          const std::array<std::uint32_t, 256> &commands,
+                                          std::uint64_t lighting_state_revision) {
+    struct LightingCache {
+        std::uint64_t revision{};
+        bool has_vertex_color{};
+        bool valid{};
+        PreparedLighting state{};
+    };
+    static thread_local LightingCache lighting_cache;
+    if (lighting_state_revision != 0u && lighting_cache.valid &&
+        lighting_cache.revision == lighting_state_revision &&
+        lighting_cache.has_vertex_color == has_vertex_color)
+        return lighting_cache.state;
+    const PreparedLighting prepared = prepare_lighting(has_vertex_color, commands);
+    if (lighting_state_revision != 0u) {
+        lighting_cache.revision = lighting_state_revision;
+        lighting_cache.has_vertex_color = has_vertex_color;
+        lighting_cache.state = prepared;
+        lighting_cache.valid = true;
+    }
+    return prepared;
+}
+
 // Stage 45.5: collapse the complete PSP lighting equation into
 // outColor = inColor * mul + add when every enabled light is directional.
 // For vtype 0x0115 there is no stored normal, so the transformed default normal
@@ -1426,11 +1453,53 @@ bool prepare_directional_lighting_affine(const PreparedLighting &state,
     return true;
 }
 
+// Fills the GPU vertex-lighting terms of `hw` when apply_prepared_lighting()
+// reduces to what the GL vertex shader evaluates: every enabled light
+// directional and diffuse-only, and no material colour taken from the vertex.
+// Then the colour is base + sum(max(dot(L, n), 0) * diffuse), with the same
+// terms apply_prepared_lighting() adds. PES6 lights every lit draw of a match
+// this way (3 directional lights, measured).
+bool prepare_gpu_vertex_lighting(const PreparedLighting &state,
+                                 const std::array<std::uint32_t, 256> &commands,
+                                 const GeTransformState &transform,
+                                 GeGpuHardwareTransform &hw) noexcept {
+    if (!state.enabled || state.material_update != 0u) return false;
+    for (const PreparedLight &light : state.lights)
+        if (light.enabled && (light.type != 0u || light.computation != 0u)) return false;
+    const FloatColor base_ambient = multiply(state.material_ambient, state.global_ambient);
+    FloatColor base = state.emissive;
+    add_rgb(base, base_ambient);
+    for (std::size_t index = 0u; index < state.lights.size(); ++index) {
+        const PreparedLight &light = state.lights[index];
+        hw.light_direction[index] = {};
+        hw.light_diffuse[index] = {};
+        if (!light.enabled) continue;
+        add_rgb(base, multiply(light.ambient, state.material_ambient, 1.0f));
+        const FloatColor diffuse = multiply(light.diffuse, state.material_diffuse, 1.0f);
+        hw.light_direction[index] = {light.vector.x, light.vector.y, light.vector.z, 1.0f};
+        hw.light_diffuse[index] = {diffuse.r, diffuse.g, diffuse.b, 0.0f};
+    }
+    hw.light_base = {base.r, base.g, base.b, base_ambient.a};
+    hw.world = transform.world;
+    hw.reverse_normals = (data24(commands[0x51u]) & 1u) != 0u;
+    hw.vertex_lighting = true;
+    return true;
+}
+
+bool gpu_vertex_lighting_enabled() noexcept {
+    static const bool enabled = [] {
+        const char *text = std::getenv("PSPRECOMP_GE_GPU_HW_LIGHTING");
+        return text == nullptr || (*text != '\0' && std::strcmp(text, "0") != 0);
+    }();
+    return enabled;
+}
+
 bool decode_vertex(const psprecomp::GuestMemory &memory, std::uint32_t address,
                    const VertexLayout &layout,
                    const std::array<std::uint32_t, 256> &commands,
                    const GeTransformState &transform,
-                   Vertex &vertex, std::string &error) {
+                   Vertex &vertex, std::string &error,
+                   const PreparedLighting *prepared_lighting = nullptr) {
     if (!memory.contains(address, layout.stride)) {
         error = "GE vertex lies outside guest memory at " + psprecomp::hex32(address);
         return false;
@@ -1523,8 +1592,11 @@ bool decode_vertex(const psprecomp::GuestMemory &memory, std::uint32_t address,
         world_normal = transform_normal_4x3(transform.world, model_normal);
         if ((data24(commands[0x51u]) & 1u) != 0u) world_normal = world_normal * -1.0f;
         world_normal = normalized_or_001(world_normal);
-        vertex.color = apply_lighting(vertex.color, layout.color_type >= 4u, world_position,
-                                      world_normal, commands);
+        vertex.color = prepared_lighting != nullptr
+            ? apply_prepared_lighting(vertex.color, world_position, world_normal,
+                                      *prepared_lighting)
+            : apply_lighting(vertex.color, layout.color_type >= 4u, world_position,
+                             world_normal, commands);
     }
 
     const Vec3 view = transform_4x3(transform.view, world_position);
@@ -1644,12 +1716,14 @@ bool decode_vertex_optimized(const psprecomp::GuestMemory &memory, std::uint32_t
                              const VertexLayout &layout,
                              const std::array<std::uint32_t, 256> &commands,
                              const GeTransformState &transform,
-                             Vertex &vertex, std::string &error) {
+                             Vertex &vertex, std::string &error,
+                             const PreparedLighting *prepared_lighting = nullptr) {
     const std::uint32_t uv_mode = data24(commands[0xC0u]) & 3u;
     if (layout.type == 0x000115u && !layout.through &&
         (data24(commands[0x17u]) & 1u) == 0u && (uv_mode == 0u || uv_mode == 3u))
         return decode_vertex_0115_fast(memory, address, layout, commands, transform, vertex, error);
-    return decode_vertex(memory, address, layout, commands, transform, vertex, error);
+    return decode_vertex(memory, address, layout, commands, transform, vertex, error,
+                         prepared_lighting);
 }
 
 
@@ -1725,6 +1799,75 @@ bool decode_model_vertex_0115_for_gpu_fast(
     return true;
 }
 
+// Readers over a vertex the caller already resolved to host memory (the
+// whole contiguous range of a draw is validated once). Same arithmetic as the
+// GuestMemory-based readers above; they only skip the per-component address
+// resolution and bounds check, which was a visible share of a match frame.
+std::uint16_t raw_le16(const std::uint8_t *raw) noexcept {
+    return static_cast<std::uint16_t>(raw[0] | (raw[1] << 8u));
+}
+std::uint32_t raw_le32(const std::uint8_t *raw) noexcept {
+    return static_cast<std::uint32_t>(raw[0]) | (static_cast<std::uint32_t>(raw[1]) << 8u) |
+           (static_cast<std::uint32_t>(raw[2]) << 16u) | (static_cast<std::uint32_t>(raw[3]) << 24u);
+}
+
+void read_texcoord_raw(const std::uint8_t *raw, std::uint32_t format, float &u, float &v) noexcept {
+    switch (format) {
+    case 0u: u = v = 0.0f; break;
+    case 1u:
+        u = static_cast<float>(raw[0]) * (1.0f / 128.0f);
+        v = static_cast<float>(raw[1]) * (1.0f / 128.0f);
+        break;
+    case 2u:
+        u = static_cast<float>(raw_le16(raw)) * (1.0f / 32768.0f);
+        v = static_cast<float>(raw_le16(raw + 2)) * (1.0f / 32768.0f);
+        break;
+    case 3u:
+        u = std::bit_cast<float>(raw_le32(raw));
+        v = std::bit_cast<float>(raw_le32(raw + 4));
+        break;
+    }
+}
+
+Color read_vertex_color_raw(const std::uint8_t *raw, std::uint32_t format) noexcept {
+    switch (format) {
+    case 4u: return unpack16(raw_le16(raw), 0u);
+    case 5u: return unpack16(raw_le16(raw), 1u);
+    case 6u: return unpack16(raw_le16(raw), 2u);
+    case 7u: return unpack32(raw_le32(raw));
+    default: return {};
+    }
+}
+
+Vec3 read_vector3_raw(const std::uint8_t *raw, std::uint32_t format) noexcept {
+    switch (format) {
+    case 1u: return {signed_normalized8(raw[0]), signed_normalized8(raw[1]), signed_normalized8(raw[2])};
+    case 2u: return {signed_normalized16(raw_le16(raw)), signed_normalized16(raw_le16(raw + 2)),
+                     signed_normalized16(raw_le16(raw + 4))};
+    case 3u: return {std::bit_cast<float>(raw_le32(raw)), std::bit_cast<float>(raw_le32(raw + 4)),
+                     std::bit_cast<float>(raw_le32(raw + 8))};
+    default: return {};
+    }
+}
+
+std::array<float, 12> compute_skin_matrix_raw(const std::uint8_t *raw, const VertexLayout &layout,
+                                              const GeTransformState &transform) noexcept {
+    std::array<float, 12> skin{};
+    for (std::uint32_t bone = 0u; bone < layout.weight_count; ++bone) {
+        float weight = 0.0f;
+        switch (layout.weight_type) {
+        case 1u: weight = raw[layout.weight_offset + bone] * (1.0f / 128.0f); break;
+        case 2u: weight = raw_le16(raw + layout.weight_offset + bone * 2u) * (1.0f / 32768.0f); break;
+        case 3u: weight = std::bit_cast<float>(raw_le32(raw + layout.weight_offset + bone * 4u)); break;
+        }
+        if (weight == 0.0f) continue;
+        const std::size_t bone_base = static_cast<std::size_t>(bone) * 12u;
+        for (std::size_t element = 0u; element < skin.size(); ++element)
+            skin[element] += transform.bones[bone_base + element] * weight;
+    }
+    return skin;
+}
+
 bool decode_model_vertex_for_gpu(const psprecomp::GuestMemory &memory,
                                  std::uint32_t address,
                                  const VertexLayout &layout,
@@ -1734,11 +1877,13 @@ bool decode_model_vertex_for_gpu(const psprecomp::GuestMemory &memory,
                                  const PreparedLighting *prepared_lighting,
                                  std::uint32_t uv_generation,
                                  GeGpuVertex &vertex,
-                                 std::string &error) {
+                                 std::string &error,
+                                 const std::uint8_t *prevalidated_raw = nullptr,
+                                 bool emit_model_normal = false) {
     // The common VCS city vertex format does not need the generic decoder at
     // all when UV generation is direct. Keep lighting support so the same
     // specialization covers lit and unlit opaque world geometry.
-    if (layout.type == 0x000115u && !layout.through &&
+    if (!emit_model_normal && layout.type == 0x000115u && !layout.through &&
         layout.morph_count == 1u && layout.weight_type == 0u &&
         layout.normal_type == 0u && uv_generation == 0u) {
         return decode_model_vertex_0115_for_gpu_fast(
@@ -1746,14 +1891,19 @@ bool decode_model_vertex_for_gpu(const psprecomp::GuestMemory &memory,
             prepared_lighting, vertex, error);
     }
 
-    if (!memory.contains(address, layout.stride)) {
+    // Single-morph vertices in a range the caller already resolved decode
+    // straight from host memory.
+    const std::uint8_t *raw = layout.morph_count == 1u ? prevalidated_raw : nullptr;
+    if (raw == nullptr && !memory.contains(address, layout.stride)) {
         error = "GE hardware-transform vertex lies outside guest memory at " +
             psprecomp::hex32(address);
         return false;
     }
 
     float u = 0.0f, v = 0.0f;
-    if (layout.morph_count == 1u) {
+    if (raw != nullptr) {
+        read_texcoord_raw(raw + layout.tc_offset, layout.tc_type, u, v);
+    } else if (layout.morph_count == 1u) {
         read_texcoord(memory, address + layout.tc_offset, layout.tc_type, false, u, v);
     } else {
         for (std::uint32_t morph = 0u; morph < layout.morph_count; ++morph) {
@@ -1765,9 +1915,13 @@ bool decode_model_vertex_for_gpu(const psprecomp::GuestMemory &memory,
         }
     }
 
-    const Color color = morph_color(memory, address, layout, transform, commands);
+    const Color color = raw == nullptr ? morph_color(memory, address, layout, transform, commands)
+        : layout.color_type < 4u ? material_ambient_color(commands)
+        : read_vertex_color_raw(raw + layout.color_offset, layout.color_type);
     Vec3 model_position{};
-    if (layout.morph_count == 1u) {
+    if (raw != nullptr) {
+        model_position = read_vector3_raw(raw + layout.position_offset, layout.position_type);
+    } else if (layout.morph_count == 1u) {
         model_position = read_vector3(memory, address + layout.position_offset,
                                       layout.position_type);
     } else {
@@ -1779,15 +1933,18 @@ bool decode_model_vertex_for_gpu(const psprecomp::GuestMemory &memory,
     }
     const std::uint32_t uv_generation_source =
         (data24(commands[0xC0u]) >> 8u) & 3u;
-    const bool model_normal_needed = lighting_enabled || uv_generation == 2u ||
+    const bool model_normal_needed = lighting_enabled || emit_model_normal || uv_generation == 2u ||
         (uv_generation == 1u && uv_generation_source >= 2u);
     Vec3 model_normal{0.0f, 0.0f, 1.0f};
     if (model_normal_needed && layout.normal_type != 0u)
-        model_normal = read_vector3(memory, address + layout.normal_offset,
-                                    layout.normal_type);
+        model_normal = raw != nullptr
+            ? read_vector3_raw(raw + layout.normal_offset, layout.normal_type)
+            : read_vector3(memory, address + layout.normal_offset, layout.normal_type);
 
     if (layout.weight_type != 0u) {
-        const std::array<float, 12> skin = compute_skin_matrix(memory, address, layout, transform);
+        const std::array<float, 12> skin = raw != nullptr
+            ? compute_skin_matrix_raw(raw, layout, transform)
+            : compute_skin_matrix(memory, address, layout, transform);
         model_position = transform_4x3(skin, model_position);
         if (model_normal_needed)
             model_normal = transform_normal_4x3(skin, model_normal);
@@ -1862,6 +2019,11 @@ bool decode_model_vertex_for_gpu(const psprecomp::GuestMemory &memory,
     vertex.v = v;
     vertex.q = generated_q;
     vertex.fog_factor = 1.0f;
+    if (emit_model_normal) {
+        vertex.nx = model_normal.x;
+        vertex.ny = model_normal.y;
+        vertex.nz = model_normal.z;
+    }
     vertex.rgba = static_cast<std::uint32_t>(final_color.r) |
         (static_cast<std::uint32_t>(final_color.g) << 8u) |
         (static_cast<std::uint32_t>(final_color.b) << 16u) |
@@ -2492,7 +2654,57 @@ bool decode_texture_rgba_into(const psprecomp::GuestMemory &memory,
         }
     }
 
+    // T8 (the bulk of PES6's textures) and the direct-colour formats took the
+    // per-texel generic sampler: a format switch, offset maths, a CLUT
+    // transform and four byte stores per texel. Resolve the 256-entry palette
+    // once and write packed RGBA words; same offsets as sample_texture_wrapped.
+    const auto pack_rgba = [](Color c) noexcept {
+        std::uint32_t packed = static_cast<std::uint32_t>(c.r) |
+            (static_cast<std::uint32_t>(c.g) << 8u) |
+            (static_cast<std::uint32_t>(c.b) << 16u) |
+            (static_cast<std::uint32_t>(c.a) << 24u);
+        if constexpr (std::endian::native == std::endian::big)
+            packed = ((packed & 0x000000FFu) << 24u) | ((packed & 0x0000FF00u) << 8u) |
+                     ((packed & 0x00FF0000u) >> 8u) | ((packed & 0xFF000000u) >> 24u);
+        return packed;
+    };
+    const bool fast_t8 = texture.format == 5u && texture.pixels != nullptr;
+    const bool fast_direct = texture.format <= 3u && texture.pixels != nullptr;
+    std::array<std::uint32_t, 256> t8_palette_rgba{};
+    if (fast_t8) {
+        for (std::uint32_t i = 0; i < t8_palette_rgba.size(); ++i)
+            t8_palette_rgba[i] = pack_rgba(read_clut_fast(memory, texture, i));
+    }
+
     auto decode_rows = [&](std::uint32_t first_row, std::uint32_t last_row) {
+        if (fast_t8 || fast_direct) {
+            const std::uint32_t bytes_per_texel = fast_t8 ? 1u : (texture.format == 3u ? 4u : 2u);
+            const std::uint32_t row_bytes = texture.buffer_width * bytes_per_texel;
+            const std::uint8_t *pixels = texture.pixels;
+            for (std::uint32_t y = first_row; y <= last_row; ++y) {
+                std::byte *dst = rgba8.data() + static_cast<std::size_t>(y) * texture.width * 4u;
+                for (std::uint32_t x = 0u; x < texture.width; ++x, dst += 4) {
+                    const std::uint32_t byte_x = x * bytes_per_texel;
+                    const std::uint32_t offset = texture.swizzled
+                        ? swizzled_offset(byte_x, y, row_bytes) : (y * row_bytes + byte_x);
+                    std::uint32_t packed;
+                    if (fast_t8) {
+                        packed = t8_palette_rgba[pixels[offset]];
+                    } else if (texture.format == 3u) {
+                        packed = pack_rgba(unpack32(static_cast<std::uint32_t>(pixels[offset]) |
+                            (static_cast<std::uint32_t>(pixels[offset + 1u]) << 8u) |
+                            (static_cast<std::uint32_t>(pixels[offset + 2u]) << 16u) |
+                            (static_cast<std::uint32_t>(pixels[offset + 3u]) << 24u)));
+                    } else {
+                        packed = pack_rgba(unpack16(static_cast<std::uint16_t>(
+                            static_cast<std::uint16_t>(pixels[offset]) |
+                            (static_cast<std::uint16_t>(pixels[offset + 1u]) << 8u)), texture.format));
+                    }
+                    std::memcpy(dst, &packed, sizeof(packed));
+                }
+            }
+            return;
+        }
         if (fast_t4) {
             const std::uint32_t row_bytes = (texture.buffer_width + 1u) >> 1u;
             const std::uint32_t blocks_per_row = (row_bytes + 15u) >> 4u;
@@ -4012,6 +4224,48 @@ std::uint32_t index_size(std::uint32_t index_type) noexcept {
     switch (index_type) { case 1u: return 1u; case 2u: return 2u; case 3u: return 4u; default: return 0u; }
 }
 
+// Palette bytes are hashed once per CLOAD instead of once per draw: the GE
+// reads its internal copy, so between two loads the window a draw indexes can
+// only differ by address or size. The FNV loop is a serial multiply chain and
+// was a fifth of the GE thread in a match (~2000 draws per frame, most of them
+// T8 with a CLUT). Small direct-mapped memo, flushed by every load.
+std::uint32_t clut_window_checksum(const psprecomp::GuestMemory &memory,
+                                   std::uint32_t address, std::uint32_t bytes) noexcept {
+    struct Entry {
+        std::uint64_t serial{};
+        std::uint32_t address{};
+        std::uint32_t bytes{};
+        std::uint32_t checksum{};
+    };
+    static thread_local std::array<Entry, 8> memo{};
+    const std::uint64_t serial = g_ge_clut_load_serial.load(std::memory_order_relaxed);
+    Entry &entry = memo[((address >> 4u) ^ (bytes >> 1u)) & 7u];
+    if (entry.serial == serial && entry.address == address && entry.bytes == bytes)
+        return entry.checksum;
+
+    std::uint32_t checksum = 0u;
+    if (const std::uint8_t *clut = memory.raw_pointer(address, bytes)) {
+        checksum = 2166136261u;
+        std::uint32_t offset = 0u;
+        for (; offset + 4u <= bytes; offset += 4u) {
+            const std::uint32_t word = static_cast<std::uint32_t>(clut[offset]) |
+                (static_cast<std::uint32_t>(clut[offset + 1u]) << 8u) |
+                (static_cast<std::uint32_t>(clut[offset + 2u]) << 16u) |
+                (static_cast<std::uint32_t>(clut[offset + 3u]) << 24u);
+            checksum ^= word;
+            checksum *= 16777619u;
+        }
+        if (offset < bytes) {
+            std::uint32_t tail = clut[offset];
+            if (offset + 1u < bytes) tail |= static_cast<std::uint32_t>(clut[offset + 1u]) << 8u;
+            checksum ^= tail;
+            checksum *= 16777619u;
+        }
+    }
+    entry = Entry{serial, address, bytes, checksum};
+    return checksum;
+}
+
 } // namespace
 
 bool test_ge_bounding_box(const psprecomp::GuestMemory &memory,
@@ -4144,6 +4398,41 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
                                     data24(commands[0xC3u]) & 0xFu, fb}];
     }
 
+    // PSPRECOMP_GE_VTYPE_CENSUS: draws and vertices per (vertex type, lighting,
+    // UV generation, primitive, flat shading), printed at exit. Says which
+    // vertex formats a decode fast path has to cover.
+    static const bool vtype_census = std::getenv("PSPRECOMP_GE_VTYPE_CENSUS") != nullptr;
+    if (vtype_census) {
+        struct Census {
+            std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>,
+                     std::pair<std::uint64_t, std::uint64_t>> draws;
+            std::mutex mutex;
+            ~Census() {
+                std::vector<std::pair<std::uint64_t, std::string>> rows;
+                std::uint64_t total = 0u;
+                for (const auto &[key, value] : draws) {
+                    char line[160];
+                    std::snprintf(line, sizeof(line),
+                                  "  vtype=0x%06X lit=%u uvgen=%u prim=%u flat=%u draws=%llu verts=%llu",
+                                  std::get<0>(key), std::get<1>(key), std::get<2>(key), std::get<3>(key),
+                                  std::get<4>(key), static_cast<unsigned long long>(value.first),
+                                  static_cast<unsigned long long>(value.second));
+                    rows.emplace_back(value.second, line);
+                    total += value.second;
+                }
+                std::sort(rows.rbegin(), rows.rend());
+                std::fprintf(stderr, "[ge-vtype-census] %llu vertices\n", static_cast<unsigned long long>(total));
+                for (const auto &row : rows) std::fprintf(stderr, "%s\n", row.second.c_str());
+            }
+        };
+        static Census census;
+        std::lock_guard lock(census.mutex);
+        auto &entry = census.draws[{layout.type, data24(commands[0x17u]) & 1u, data24(commands[0xC0u]) & 3u,
+                                    primitive, (data24(commands[0x50u]) & 1u) == 0u ? 1u : 0u}];
+        ++entry.first;
+        entry.second += count;
+    }
+
     const bool gpu_backend_enabled = ge_gpu_backend_active();
     GeGpuDrawDescriptor gpu_draw{};
     {
@@ -4258,33 +4547,33 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             const std::uint32_t entry_bytes = gpu_draw.clut_format == 3u ? 4u : 2u;
             const std::uint32_t first = std::min(gpu_draw.clut_start, 255u);
             const std::uint32_t last = std::min(first + gpu_draw.clut_mask, 255u);
-            const std::uint32_t offset_bytes = first * entry_bytes;
-            const std::uint32_t clut_bytes = (last - first + 1u) * entry_bytes;
-            if (const std::uint8_t *clut = memory.raw_pointer(
-                    gpu_draw.clut_address + offset_bytes, clut_bytes)) {
-                std::uint32_t checksum = 2166136261u;
-                std::uint32_t offset = 0u;
-                for (; offset + 4u <= clut_bytes; offset += 4u) {
-                    const std::uint32_t word = static_cast<std::uint32_t>(clut[offset]) |
-                        (static_cast<std::uint32_t>(clut[offset + 1u]) << 8u) |
-                        (static_cast<std::uint32_t>(clut[offset + 2u]) << 16u) |
-                        (static_cast<std::uint32_t>(clut[offset + 3u]) << 24u);
-                    checksum ^= word;
-                    checksum *= 16777619u;
-                }
-                if (offset < clut_bytes) {
-                    std::uint32_t tail = clut[offset];
-                    if (offset + 1u < clut_bytes) tail |= static_cast<std::uint32_t>(clut[offset + 1u]) << 8u;
-                    checksum ^= tail;
-                    checksum *= 16777619u;
-                }
-                gpu_draw.clut_checksum = checksum;
-            }
+            gpu_draw.clut_checksum = clut_window_checksum(
+                memory, gpu_draw.clut_address + first * entry_bytes,
+                (last - first + 1u) * entry_bytes);
         }
         // All texture identity fields, including the mutable CLUT checksum, are
         // final now. Hash them once; the backend will reuse these derived keys
-        // throughout signature/cache/upload/accumulation for this PRIM.
-        ge_gpu_backend_prepare_texture_keys(gpu_draw);
+        // throughout signature/cache/upload/accumulation for this PRIM. They
+        // depend only on the cached descriptor and the CLUT checksum, so a run
+        // of draws with the same state reuses them.
+        {
+            struct KeyCache {
+                std::uint64_t revision{std::numeric_limits<std::uint64_t>::max()};
+                std::uint32_t clut_checksum{};
+                std::uint64_t cache_key{};
+                std::uint64_t image_key{};
+            };
+            static thread_local KeyCache key_cache;
+            if (draw_state_revision != 0u && key_cache.revision == draw_state_revision &&
+                key_cache.clut_checksum == gpu_draw.clut_checksum) {
+                gpu_draw.texture_cache_key_hint = key_cache.cache_key;
+                gpu_draw.texture_image_key_hint = key_cache.image_key;
+            } else {
+                ge_gpu_backend_prepare_texture_keys(gpu_draw);
+                key_cache = KeyCache{draw_state_revision, gpu_draw.clut_checksum,
+                                     gpu_draw.texture_cache_key_hint, gpu_draw.texture_image_key_hint};
+            }
+        }
         gpu_draw.texture_content_signature = 0u;
         if (gpu_draw.texture_enabled && ge_gpu_backend_texture_signature_needed(gpu_draw)) {
             const bool feedback = ge_gpu_backend_is_framebuffer_feedback_texture(gpu_draw);
@@ -4348,6 +4637,15 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         ge_gpu_backend_texture_needed(gpu_draw) &&
         !ge_gpu_backend_adopt_shared_texture(gpu_draw)) {
         PhaseTimer texture_timer(g_ge_texture_upload_ns);
+        struct UploadTotalsTimer {
+            std::chrono::steady_clock::time_point entry{std::chrono::steady_clock::now()};
+            ~UploadTotalsTimer() {
+                ++g_ge_texture_uploads;
+                g_ge_texture_upload_total_ns += static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - entry).count());
+            }
+        } upload_totals_timer;
         const bool framebuffer_feedback =
             ge_gpu_backend_is_framebuffer_feedback_texture(gpu_draw);
         const std::uint32_t level_count = framebuffer_feedback ? 1u :
@@ -4423,35 +4721,9 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
 
     if (hw_transform_eligible) {
         PreparedLighting prepared_lighting{};
-        if (hw_lighting_on_cpu) {
-            // Lighting registers normally stay unchanged for long runs of world draws.
-            // Decoding/normalizing all four PSP lights per PRIM was pure serial GE work.
-            // The profile supplies a monotonic lighting-state revision, so reuse the
-            // prepared immutable state until one of the actual lighting/material
-            // registers changes.  Tests/standalone callers pass revision 0 and keep
-            // the exact uncached behavior.
-            struct LightingCache {
-                std::uint64_t revision{};
-                bool has_vertex_color{};
-                bool valid{};
-                PreparedLighting state{};
-            };
-            static thread_local LightingCache lighting_cache;
-            const bool has_vertex_color = layout.color_type >= 4u;
-            if (lighting_state_revision != 0u && lighting_cache.valid &&
-                lighting_cache.revision == lighting_state_revision &&
-                lighting_cache.has_vertex_color == has_vertex_color) {
-                prepared_lighting = lighting_cache.state;
-            } else {
-                prepared_lighting = prepare_lighting(has_vertex_color, commands);
-                if (lighting_state_revision != 0u) {
-                    lighting_cache.revision = lighting_state_revision;
-                    lighting_cache.has_vertex_color = has_vertex_color;
-                    lighting_cache.state = prepared_lighting;
-                    lighting_cache.valid = true;
-                }
-            }
-        }
+        if (hw_lighting_on_cpu)
+            prepared_lighting = cached_prepared_lighting(layout.color_type >= 4u, commands,
+                                                         lighting_state_revision);
         static thread_local std::vector<std::uint32_t> occurrence_indices;
         static thread_local std::vector<std::uint32_t> unique_indices;
         static thread_local std::vector<std::uint32_t> occurrence_remap;
@@ -4557,7 +4829,10 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             fast_0115_world_normal_ptr = &fast_0115_world_normal;
         }
 
-        const GeGpuDrawDescriptor effective_draw = gpu_effective_draw_descriptor(gpu_draw);
+        // Only clear mode changes the descriptor; skip the ~450-byte copy otherwise.
+        GeGpuDrawDescriptor clear_mode_draw{};
+        if (gpu_draw.clear_mode) clear_mode_draw = gpu_effective_draw_descriptor(gpu_draw);
+        const GeGpuDrawDescriptor &effective_draw = gpu_draw.clear_mode ? clear_mode_draw : gpu_draw;
         const bool sampled_texture_ready = effective_draw.texture_enabled &&
             ge_gpu_backend_texture_available(effective_draw);
 
@@ -4576,11 +4851,35 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             gpu_directional_lighting = prepare_directional_lighting_affine(
                 prepared_lighting, *fast_0115_world_normal_ptr, gpu_light_mul, gpu_light_add);
         }
-        const bool cpu_lighting_effective = hw_lighting_on_cpu && !gpu_directional_lighting;
         const bool flat_shading = (data24(commands[0x50u]) & 1u) == 0u;
+        // Everything else lit goes to the VS when the lights allow it (see
+        // prepare_gpu_vertex_lighting); flat shading keeps the CPU path, which
+        // picks the provoking vertex's colour per triangle.
+        GeGpuHardwareTransform gpu_lighting_terms{};
+        const bool gpu_vertex_lighting = hw_lighting_on_cpu && !gpu_directional_lighting &&
+            !flat_shading && gpu_vertex_lighting_enabled() &&
+            !gpu_force_white_vertex_colors_enabled() && !gpu_geometry_debug_colors_enabled() &&
+            (!effective_draw.texture_enabled || sampled_texture_ready) &&
+            prepare_gpu_vertex_lighting(prepared_lighting, commands, transform, gpu_lighting_terms);
+        const bool cpu_lighting_effective = hw_lighting_on_cpu && !gpu_directional_lighting &&
+            !gpu_vertex_lighting;
         GeGpuHardwareTransform hw =
             build_gpu_hardware_transform(commands, transform, cpu_lighting_effective,
                                          uv_generation == 1u || uv_generation == 2u);
+        if (gpu_vertex_lighting) {
+            hw.vertex_lighting = true;
+            hw.reverse_normals = gpu_lighting_terms.reverse_normals;
+            hw.world = gpu_lighting_terms.world;
+            hw.light_base = gpu_lighting_terms.light_base;
+            hw.light_direction = gpu_lighting_terms.light_direction;
+            hw.light_diffuse = gpu_lighting_terms.light_diffuse;
+        }
+        // decode_vertex() leaves U/V at 0 when the format has no texture
+        // coordinates and nothing generates them; scale/offset would move them.
+        if (layout.tc_type == 0u && uv_generation != 1u && uv_generation != 2u) {
+            hw.uv_scale_u = hw.uv_scale_v = 1.0f;
+            hw.uv_offset_u = hw.uv_offset_v = 0.0f;
+        }
         // D3D12 supports strips natively; triangle fans are expanded to a list.
         hw.primitive = primitive == 5u ? 3u : primitive;
         hw.vertex_color_affine = gpu_directional_lighting;
@@ -4690,7 +4989,11 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
                                                layout, transform, commands,
                                                cpu_lighting_effective,
                                                cpu_lighting_effective ? &prepared_lighting : nullptr,
-                                               uv_generation, decoded_vertices[i], decode_error);
+                                               uv_generation, decoded_vertices[i], decode_error,
+                                               contiguous_raw != nullptr
+                                                   ? contiguous_raw + i * static_cast<std::size_t>(layout.stride)
+                                                   : nullptr,
+                                               gpu_vertex_lighting);
         };
 
         RowWorkerPool &decode_pool = RowWorkerPool::instance();
@@ -4770,25 +5073,34 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         // triangle-local duplication because provoking-vertex colour semantics
         // intentionally assign one colour to all three compact model vertices.
         if (!flat_shading) {
-            for (GeGpuVertex &vertex : decoded_vertices)
-                vertex = finalize_vertex(vertex);
-
-            // The most common model path -- non-indexed PSP TRIANGLES -- is
-            // already an exact triangle stream. Do not manufacture and upload
-            // 0,1,2,3,... uint32 indices merely to call vkCmdDrawIndexed. An
-            // empty index span tells the backend to merge/submit it with vkCmdDraw.
-            if (direct_nonindexed_gpu_draw_enabled() &&
-                !indexed && primitive == 3u && (count % 3u) == 0u &&
-                decoded_vertices.size() == count) {
-                if (collect_diagnostic_stats) stats.triangles += count / 3u;
-                {
-                    PhaseTimer accumulate_timer(g_ge_gpu_accumulate_ns);
-                    ge_gpu_backend_accumulate_hardware_triangles(
-                        effective_draw, hw, decoded_vertices, {});
-                }
-                advance_stream();
-                return true;
+            // The GL backend reads only position, colour, UV and Q from these
+            // vertices (alpha, texture and fog state travel per batch), so
+            // only a colour override needs the per-vertex pass.
+            const bool recolor = gpu_force_white_vertex_colors_enabled() ||
+                gpu_geometry_debug_colors_enabled() ||
+                (effective_draw.texture_enabled && !sampled_texture_ready);
+            if (recolor) {
+                for (GeGpuVertex &vertex : decoded_vertices)
+                    vertex = finalize_vertex(vertex);
             }
+
+            // Lists, strips and fans are assembled by the backend straight
+            // into its index stream (one pass, no intermediate index vector):
+            // building them here with emit_triangle() below cost as much as
+            // decoding the vertices. Matches emit_triangle's vertex order.
+            if (collect_diagnostic_stats)
+                stats.triangles += primitive == 3u ? count / 3u : (count > 2u ? count - 2u : 0u);
+            {
+                PhaseTimer accumulate_timer(g_ge_gpu_accumulate_ns);
+                const std::span<const std::uint32_t> order = !indexed ? std::span<const std::uint32_t>{}
+                    : contiguous_decode ? std::span<const std::uint32_t>(occurrence_indices)
+                                        : std::span<const std::uint32_t>(occurrence_remap);
+                ge_gpu_backend_accumulate_hardware_primitive(
+                    effective_draw, hw, primitive, decoded_vertices, order,
+                    indexed && contiguous_decode ? contiguous_first : 0u);
+            }
+            advance_stream();
+            return true;
         }
         const auto occurrence_index = [&](std::size_t i) -> std::uint32_t {
             if (!indexed) return static_cast<std::uint32_t>(i);
@@ -4876,11 +5188,19 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         vertices.reserve(count);
         const IndexStreamReader draw_indices =
             make_index_reader(memory, index_address, layout.index_type, count);
+        PreparedLighting prepared_lighting{};
+        const PreparedLighting *prepared_lighting_ptr = nullptr;
+        if (!layout.through && (data24(commands[0x17u]) & 1u) != 0u) {
+            prepared_lighting = cached_prepared_lighting(layout.color_type >= 4u, commands,
+                                                         lighting_state_revision);
+            prepared_lighting_ptr = &prepared_lighting;
+        }
         for (std::uint32_t i = 0u; i < count; ++i) {
             const std::uint32_t index = draw_indices(i);
             Vertex vertex{};
             if (!decode_vertex_optimized(memory, vertex_address + index * layout.stride, layout,
-                                         commands, transform, vertex, error)) return false;
+                                         commands, transform, vertex, error,
+                                         prepared_lighting_ptr)) return false;
             record_clip_vertex(stats, vertex);
             if (layout.through) record_screen_vertex(stats, vertex);
             vertices.push_back(vertex);
@@ -5022,6 +5342,17 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
     }
     advance_stream();
     return true;
+}
+
+GeTextureUploadTotals take_ge_texture_upload_totals() noexcept {
+    const GeTextureUploadTotals totals{g_ge_texture_uploads, g_ge_texture_upload_total_ns};
+    g_ge_texture_uploads = 0u;
+    g_ge_texture_upload_total_ns = 0u;
+    return totals;
+}
+
+void note_ge_clut_load() noexcept {
+    g_ge_clut_load_serial.fetch_add(1u, std::memory_order_relaxed);
 }
 
 GePhaseTotals ge_phase_totals() noexcept {

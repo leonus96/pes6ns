@@ -19,7 +19,13 @@ namespace pes6 {
 // interval).
 class StreamingLinearResampler {
 public:
+    // The mixer's output rate: 48 kHz on Switch, audout's only rate, so PSP
+    // audio is resampled once instead of again by the device.
+#if defined(__SWITCH__)
+    static constexpr std::uint32_t kOutputRate = 48000u;
+#else
     static constexpr std::uint32_t kOutputRate = 44100u;
+#endif
 
     void reset(std::uint32_t source_rate = kOutputRate, bool stereo = true) noexcept {
         source_rate_ = source_rate == 0u ? kOutputRate : source_rate;

@@ -36,8 +36,14 @@ if(PES6_USE_SDL2 AND SDL2_FOUND)
     # The GL GE backend needs SDL's GL context; PES6_RENDERER=gl turns it on.
     list(APPEND PES6_HOST_SOURCES
         "${PES6_PROFILE_DIR}/host/display_window_sdl.cpp"
-        "${PES6_PROFILE_DIR}/host/audio_device_sdl.cpp"
         "${PES6_PROFILE_DIR}/host/ge_gpu_backend_gl.cpp")
+    # Switch: libnx audout on a thread of our own (see audio_device_switch.cpp
+    # for why not SDL's audio thread there).
+    if(NINTENDO_SWITCH)
+        list(APPEND PES6_HOST_SOURCES "${PES6_PROFILE_DIR}/host/audio_device_switch.cpp")
+    else()
+        list(APPEND PES6_HOST_SOURCES "${PES6_PROFILE_DIR}/host/audio_device_sdl.cpp")
+    endif()
     message(STATUS "PES6: SDL2 display and audio backend, OpenGL GE backend")
 else()
     list(APPEND PES6_HOST_SOURCES

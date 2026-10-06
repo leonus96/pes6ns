@@ -52,6 +52,7 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(const GeGpuDrawDescripto
 bool ge_gpu_backend_copy_last_texture_rgba(std::span<std::byte>) noexcept { return false; }
 void ge_gpu_backend_accumulate_color_triangles(const GeGpuDrawDescriptor &, std::span<const GeGpuVertex>) noexcept {}
 void ge_gpu_backend_accumulate_hardware_triangles(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &, std::span<const GeGpuVertex>, std::span<const std::uint32_t>) noexcept {}
+void ge_gpu_backend_accumulate_hardware_primitive(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &, std::uint32_t, std::span<const GeGpuVertex>, std::span<const std::uint32_t>, std::uint32_t) noexcept {}
 bool ge_gpu_backend_accumulate_hardware_packed_0115(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &, std::span<const std::byte>, std::uint32_t, std::span<const std::uint32_t>) noexcept { return false; }
 void ge_gpu_backend_set_native_window(void *) noexcept {}
 void ge_gpu_backend_set_display_framebuffer(std::uint32_t address) noexcept { state().display_framebuffer = address & 0x001FFFF0u; }

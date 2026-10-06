@@ -29,6 +29,15 @@ if(PES6_HOST_ONLY)
 else()
     set_target_properties(PES6Native psprecomp_core PROPERTIES CXX_EXTENSIONS ON)
 endif()
+# Without it GCC keeps errno semantics for <cmath>: std::lround becomes a call
+# to newlib's lroundf and every sqrt carries a libcall fallback, on the GE's
+# per-vertex lighting path among others. Results are unchanged (errno only);
+# Apple clang already defaults to this.
+foreach(target IN ITEMS PES6Native pes6_host psprecomp_core)
+    if(TARGET ${target})
+        target_compile_options(${target} PRIVATE -fno-math-errno)
+    endif()
+endforeach()
 
 if(PES6_HOST_ONLY)
     # CI: no game, so no generated corpus; compile-check the host only.
