@@ -399,7 +399,17 @@ const NidRegistry &Runtime::nids() const noexcept { return nids_; }
 
 void Runtime::register_function(std::uint32_t address, RecompiledFunction function, std::string name) {
     if (!function) throw Error("Attempted to register a null recompiled function");
-    functions_[address] = FunctionEntry{function, std::move(name)};
+    owned_function_names_.push_back(std::move(name));
+    register_function_entry(address, function, owned_function_names_.back());
+}
+
+void Runtime::register_function(std::uint32_t address, RecompiledFunction function, const char *name) {
+    if (!function) throw Error("Attempted to register a null recompiled function");
+    register_function_entry(address, function, name != nullptr ? std::string_view(name) : std::string_view());
+}
+
+void Runtime::register_function_entry(std::uint32_t address, RecompiledFunction function, std::string_view name) {
+    functions_.insert_or_assign(address, FunctionEntry{function, name});
     const std::uint32_t c = memory_.canonical(address);
     if ((c & 3u) != 0u || c < GuestMemory::kPhysicalBase) return;
 
@@ -436,8 +446,7 @@ void Runtime::register_function(std::uint32_t address, RecompiledFunction functi
     // Assign unconditionally -- an import stub can also be covered by a unit,
     // and a later import registration has to clear the earlier unit pointer or
     // chaining would keep running the raw code instead of the wrapper.
-    const auto &registered = functions_[address].name;
-    const bool chainable = registered.starts_with("recomp_unit_");
+    const bool chainable = name.starts_with("recomp_unit_");
     direct_chainable_[index] = chainable ? function : nullptr;
 
     if (!chainable && generated_unit_span_ != 0u && c >= generated_unit_base_) {
@@ -635,7 +644,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
                 function(*this, cpu_);
             } catch (const Error &e) {
                 const FunctionEntry *function_entry = lookup_entry(before);
-                const std::string name = function_entry != nullptr ? function_entry->name : "unknown";
+                const std::string name(function_entry != nullptr ? function_entry->name : std::string_view("unknown"));
                 std::ostringstream message;
                 message << e.what() << " while executing " << name
                         << " dispatch=" << hex32(before) << " guest_pc=" << hex32(cpu_.pc)
@@ -651,7 +660,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
             if (!stopped_) (void)account_dispatch_work(cpu_, true);
             if (!stopped_ && strict_pc_progress && cpu_.pc == before) {
                 const FunctionEntry *function_entry = lookup_entry(before);
-                const std::string name = function_entry != nullptr ? function_entry->name : "unknown";
+                const std::string name(function_entry != nullptr ? function_entry->name : std::string_view("unknown"));
                 stop("Recompiled function returned without changing PC: " + name + " at " + hex32(before));
             }
         };
@@ -674,7 +683,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
             const FunctionEntry *profile_entry = lookup_entry(hot[index].first);
             std::cerr << "[profile-window] " << hex32(hot[index].first)
                       << " count=" << hot[index].second
-                      << " name=" << (profile_entry != nullptr ? profile_entry->name : "unknown") << "\n";
+                      << " name=" << (profile_entry != nullptr ? profile_entry->name : std::string_view("unknown")) << "\n";
         }
         if (!stopped_) stop("Dispatch profile window complete at " + hex32(cpu_.pc));
         return;
@@ -715,7 +724,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
                 function(*this, cpu_);
             } catch (const Error &e) {
                 const FunctionEntry *function_entry = lookup_entry(before);
-                const std::string name = function_entry != nullptr ? function_entry->name : "unknown";
+                const std::string name(function_entry != nullptr ? function_entry->name : std::string_view("unknown"));
                 std::ostringstream message;
                 message << e.what() << " while executing " << name
                         << " dispatch=" << hex32(before) << " guest_pc=" << hex32(cpu_.pc)
@@ -742,7 +751,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
                 (void)account_dispatch_work(cpu_, true);
             if (!stopped_ && strict_pc_progress && cpu_.pc == before) {
                 const FunctionEntry *function_entry = lookup_entry(before);
-                const std::string name = function_entry != nullptr ? function_entry->name : "unknown";
+                const std::string name(function_entry != nullptr ? function_entry->name : std::string_view("unknown"));
                 stop("Recompiled function returned without changing PC: " + name + " at " + hex32(before));
             }
         }
@@ -974,7 +983,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
             }
         }
         if (trace_pc_enabled && before == trace_pc) {
-            std::cerr << "[trace-pc] " << hex32(before) << " " << (function_entry != nullptr ? function_entry->name : std::string("unknown"))
+            std::cerr << "[trace-pc] " << hex32(before) << " " << (function_entry != nullptr ? std::string(function_entry->name) : std::string("unknown"))
                       << " v0=" << hex32(cpu_.gpr[2])
                       << " a0=" << hex32(cpu_.gpr[4])
                       << " a1=" << hex32(cpu_.gpr[5])
@@ -1003,7 +1012,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
             std::cerr << "\n";
         }
         if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
-            std::cerr << "[dispatch] " << hex32(before) << " " << (function_entry != nullptr ? function_entry->name : std::string("unknown"))
+            std::cerr << "[dispatch] " << hex32(before) << " " << (function_entry != nullptr ? std::string(function_entry->name) : std::string("unknown"))
                       << " a0=" << hex32(cpu_.gpr[4])
                       << " a1=" << hex32(cpu_.gpr[5])
                       << " a2=" << hex32(cpu_.gpr[6])
@@ -1031,7 +1040,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
                 }
             }
             std::ostringstream message;
-            message << e.what() << " while executing " << (function_entry != nullptr ? function_entry->name : std::string("unknown")) << " dispatch=" << hex32(before) << " guest_pc=" << hex32(cpu_.pc)
+            message << e.what() << " while executing " << (function_entry != nullptr ? std::string(function_entry->name) : std::string("unknown")) << " dispatch=" << hex32(before) << " guest_pc=" << hex32(cpu_.pc)
                     << " (a0=" << hex32(cpu_.gpr[4]) << ", a1=" << hex32(cpu_.gpr[5])
                     << ", a2=" << hex32(cpu_.gpr[6]) << ", a3=" << hex32(cpu_.gpr[7])
                     << ", sp=" << hex32(cpu_.gpr[29]) << ", ra=" << hex32(cpu_.gpr[31]) << ")";
@@ -1087,7 +1096,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
         if (!stopped_ && cpu_.pc == before && strict_pc_progress) {
             if (trace_on_error) {
                 std::cerr << "[unchanged-pc] pc=" << hex32(before)
-                          << " function=" << (function_entry != nullptr ? function_entry->name : std::string("unknown"))
+                          << " function=" << (function_entry != nullptr ? std::string(function_entry->name) : std::string("unknown"))
                           << " v0=" << hex32(cpu_.gpr[2])
                           << " a0=" << hex32(cpu_.gpr[4])
                           << " a1=" << hex32(cpu_.gpr[5])
@@ -1100,7 +1109,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
                           << " sp=" << hex32(cpu_.gpr[29])
                           << " ra=" << hex32(cpu_.gpr[31]) << "\n";
             }
-            stop("Recompiled function returned without changing PC: " + (function_entry != nullptr ? function_entry->name : std::string("unknown")) + " at " + hex32(before));
+            stop("Recompiled function returned without changing PC: " + (function_entry != nullptr ? std::string(function_entry->name) : std::string("unknown")) + " at " + hex32(before));
         }
     }
     if (!stopped_ && max_dispatches != 0u) {
@@ -1132,7 +1141,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
                 const auto function = functions_.find(hot[index].first);
                 std::cerr << "[profile] " << hex32(hot[index].first)
                           << " count=" << hot[index].second
-                          << " name=" << (function != functions_.end() ? function->second.name : "unknown")
+                          << " name=" << (function != functions_.end() ? function->second.name : std::string_view("unknown"))
                           << "\n";
             }
         }

@@ -5,6 +5,7 @@
 #include "psprecomp/nid_registry.hpp"
 
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -81,6 +82,11 @@ public:
     const NidRegistry &nids() const noexcept;
 
     void register_function(std::uint32_t address, RecompiledFunction function, std::string name);
+    // Same, for a name with static storage duration (the string literals
+    // generated code passes): no copy is made. Overlay loads register hundreds
+    // of thousands of entry labels at once, and a heap-allocated name per
+    // label was most of that cost.
+    void register_function(std::uint32_t address, RecompiledFunction function, const char *name);
     // Removes every per-PC registration in [begin, end) and permanently
     // disables the dense generated-unit fast path for the units it touches.
     // Used for code a title loads at runtime (overlays): when new bytes land
@@ -265,7 +271,8 @@ public:
 private:
     struct FunctionEntry {
         RecompiledFunction function{};
-        std::string name;
+        // A string literal, or an element of owned_function_names_.
+        std::string_view name;
     };
 
     struct TransparentStringHash {
@@ -295,7 +302,11 @@ private:
     GuestMemory memory_;
     NidRegistry nids_;
     AllegrexContext cpu_;
+    void register_function_entry(std::uint32_t address, RecompiledFunction function, std::string_view name);
+
     std::unordered_map<std::uint32_t, FunctionEntry> functions_;
+    // Storage for names registered as std::string (deque: stable addresses).
+    std::deque<std::string> owned_function_names_;
     MissingFunctionResolver missing_function_resolver_{};
     // Direct PC table, covering only the registered code window rather than all
     // of guest RAM.  direct_base_ is its 1 MiB-aligned first canonical address.
