@@ -99,6 +99,11 @@ public:
     void set_missing_function_resolver(MissingFunctionResolver resolver) noexcept { missing_function_resolver_ = resolver; }
     void register_hle(std::string library, std::uint32_t nid, HleFunction function);
     [[nodiscard]] bool has_function(std::uint32_t address) const;
+    // The function currently registered at `address` (nullptr if none), so a
+    // profile can wrap it before registering a replacement there.
+    [[nodiscard]] RecompiledFunction registered_function(std::uint32_t address) const noexcept {
+        return lookup_function(address);
+    }
     [[nodiscard]] std::size_t function_count() const noexcept;
 
     void set_game_root(std::filesystem::path root);
