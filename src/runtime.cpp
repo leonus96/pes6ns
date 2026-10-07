@@ -1225,6 +1225,8 @@ void Runtime::invoke_import_cached(std::uint32_t slot, std::string_view library,
         import_bindings_[slot] = bound;
     }
 
+    const std::uint32_t outer_import_pc = current_import_pc_;
+    current_import_pc_ = ctx.pc;
     if (g_import_observer != nullptr) {
         const std::int32_t uid = g_runtime_thread_uid;
         const std::uint32_t a0 = ctx.gpr[4], a1 = ctx.gpr[5];
@@ -1234,6 +1236,7 @@ void Runtime::invoke_import_cached(std::uint32_t slot, std::string_view library,
         (*bound)(*this, ctx);
     }
     if (!stopped_ && g_post_import_hook != nullptr) g_post_import_hook(*this, ctx);
+    current_import_pc_ = outer_import_pc;
 }
 
 void Runtime::invoke_import(std::string_view library, std::uint32_t nid, AllegrexContext &ctx) {
@@ -1251,8 +1254,11 @@ void Runtime::invoke_import(std::string_view library, std::uint32_t nid, Allegre
         stop("Missing HLE import " + library_name + "::" + name);
         return;
     }
+    const std::uint32_t outer_import_pc = current_import_pc_;
+    current_import_pc_ = ctx.pc;
     function_it->second(*this, ctx);
     if (!stopped_ && g_post_import_hook != nullptr) g_post_import_hook(*this, ctx);
+    current_import_pc_ = outer_import_pc;
 }
 
 AllegrexContext &Runtime::cpu() noexcept { return cpu_; }

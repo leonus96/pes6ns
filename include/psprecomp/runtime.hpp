@@ -123,6 +123,11 @@ public:
     // std::function directly on every subsequent frame.
     void invoke_import_cached(std::uint32_t slot, std::string_view library,
                               std::uint32_t nid, AllegrexContext &ctx);
+    // pc the import in progress was entered at (0 outside an import). An HLE
+    // handler that sends the thread elsewhere (to a callback, say) changes
+    // ctx.pc; the post-import hook compares against this to know whether the
+    // thread resumes at ctx.pc or returns to $ra.
+    [[nodiscard]] std::uint32_t current_import_pc() const noexcept { return current_import_pc_; }
     // Executes one registered AOT function in a caller-supplied context without
     // charging guest scheduler work. Used by host render integrations that must
     // call a pure guest math helper with an isolated stack/context.
@@ -350,6 +355,7 @@ private:
     std::vector<const HleFunction *> import_bindings_;
     std::filesystem::path game_root_;
     bool stopped_{};
+    std::uint32_t current_import_pc_{};
     std::string stop_reason_;
     bool hle_histogram_enabled_{};
     // keep high-frequency dispatch counters completely cold unless

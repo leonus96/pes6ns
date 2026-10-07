@@ -207,6 +207,40 @@ static void test_import_return_context_guard() {
     psprecomp::set_runtime_thread_identity(-1, "none");
 }
 
+namespace psprecomp {
+// Defined in runtime.cpp; hosts declare it where they install their hook.
+using RuntimePostImportHook = void (*)(Runtime &, AllegrexContext &);
+void set_runtime_post_import_hook(RuntimePostImportHook hook) noexcept;
+} // namespace psprecomp
+
+static std::uint32_t import_pc_in_handler = 0u;
+static std::uint32_t import_pc_in_hook = 0u;
+static std::uint32_t ctx_pc_in_hook = 0u;
+
+// An HLE handler that sends the thread elsewhere (to a callback) changes
+// ctx.pc; the post-import hook tells that apart from a normal return by
+// comparing with current_import_pc().
+static void test_current_import_pc() {
+    psprecomp::Runtime runtime;
+    runtime.register_hle("UnitTest", 0x00000001u, [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+        import_pc_in_handler = rt.current_import_pc();
+        ctx.pc = 0x08900000u;
+    });
+    psprecomp::set_runtime_post_import_hook([](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+        import_pc_in_hook = rt.current_import_pc();
+        ctx_pc_in_hook = ctx.pc;
+    });
+    psprecomp::AllegrexContext ctx{};
+    ctx.pc = 0x08804200u;
+    require(runtime.current_import_pc() == 0u, "current_import_pc is set outside an import");
+    runtime.invoke_import("UnitTest", 0x00000001u, ctx);
+    psprecomp::set_runtime_post_import_hook(nullptr);
+    require(import_pc_in_handler == 0x08804200u, "current_import_pc wrong inside the HLE handler");
+    require(import_pc_in_hook == 0x08804200u, "current_import_pc wrong inside the post-import hook");
+    require(ctx_pc_in_hook == 0x08900000u, "post-import hook did not see the redirected pc");
+    require(runtime.current_import_pc() == 0u, "current_import_pc not cleared after the import");
+}
+
 static void put16(std::vector<std::uint8_t> &bytes, std::size_t offset, std::uint16_t value) {
     bytes[offset] = static_cast<std::uint8_t>(value);
     bytes[offset + 1] = static_cast<std::uint8_t>(value >> 8u);
@@ -877,6 +911,7 @@ static std::vector<std::uint8_t> make_relocation_test_prx() {
 int PSPRECOMP_TESTS_ENTRY() {
     try {
         test_import_return_context_guard();
+        test_current_import_pc();
         test_chained_call_context_guard();
         test_nested_direct_chain_context_guard();
 
