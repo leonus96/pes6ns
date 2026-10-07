@@ -56,6 +56,7 @@ void ge_gpu_backend_accumulate_hardware_primitive(const GeGpuDrawDescriptor &, c
 bool ge_gpu_backend_accumulate_hardware_packed_0115(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &, std::span<const std::byte>, std::uint32_t, std::span<const std::uint32_t>) noexcept { return false; }
 void ge_gpu_backend_set_native_window(void *) noexcept {}
 void ge_gpu_backend_set_display_framebuffer(std::uint32_t address) noexcept { state().display_framebuffer = address & 0x001FFFF0u; }
+void ge_gpu_backend_seal_recording() noexcept {}
 bool ge_gpu_backend_finish_color_frame(std::uint64_t) noexcept { return false; }
 bool ge_gpu_backend_copy_game_frame_rgba(std::span<std::byte>) noexcept { return false; }
 bool ge_gpu_backend_presents_directly() noexcept { return false; }

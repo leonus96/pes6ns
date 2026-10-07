@@ -564,8 +564,12 @@ void ge_gpu_backend_set_native_window(void *native_window) noexcept;
 // otherwise alternate into the window as unrelated images.
 void ge_gpu_backend_set_display_framebuffer(std::uint32_t address) noexcept;
 
-// Finishes one real VCS GPU preview frame at vblank, submits it once, waits for
-// completion and stores an RGBA8 readback. Returns true when a new frame exists.
+// Hands what the GE recorded since the last call to the GL thread. The GE must
+// be idle: the recording side and this call never run at the same time.
+void ge_gpu_backend_seal_recording() noexcept;
+
+// Submits the sealed work at vblank (GL thread). Returns true when the
+// backend is active.
 [[nodiscard]] bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept;
 
 [[nodiscard]] bool ge_gpu_backend_copy_game_frame_rgba(

@@ -39,6 +39,12 @@ void platform_show_fatal_error(std::string_view message);
 // Pins the calling thread to one core (no-op on desktop).
 void platform_pin_current_thread(int core);
 
+// Puts the calling thread one step above the emulation thread and the
+// rasterizer pool (no-op on desktop): the asynchronous GE worker, so a pool
+// worker spinning on its core does not hold it off (equal priorities on one
+// Horizon core never preempt each other).
+void platform_raise_current_thread_priority();
+
 void platform_shutdown();
 
 } // namespace pes6

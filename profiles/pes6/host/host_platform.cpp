@@ -122,6 +122,13 @@ bool platform_initialize() {
     // PES6_RENDERER=software and PES6_RENDER_SCALE=<n> in pes6.env override.
     setenv("PES6_RENDERER", "gl", 0);
     setenv("PES6_RENDER_SCALE", "2", 0);
+    // The GE draws frame N on a worker core while the game computes frame N+1
+    // (PSPRECOMP_GE_ASYNC + PES6_GE_PIPELINE, see pes6_hle.cpp): scenes the
+    // GE limits (replays, the pause screen) were at 85-93 %. Bit-identical to
+    // the synchronous GE on the desktop routes; PES6_GE_PIPELINE=0 (or
+    // PSPRECOMP_GE_ASYNC=0) in pes6.env goes back to it.
+    setenv("PSPRECOMP_GE_ASYNC", "1", 0);
+    setenv("PES6_GE_PIPELINE", "1", 0);
 
     // Every core the process may use except this (the emulation) thread's.
     u64 core_mask = 0u;
@@ -160,6 +167,14 @@ void platform_pin_current_thread(int core) {
                   << std::dec << ")\n";
 }
 
+void platform_raise_current_thread_priority() {
+    // 0x2C is the main thread's (and every std::thread's) priority.
+    const Result result = svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2B);
+    if (R_FAILED(result))
+        std::cerr << "[platform] could not raise a thread's priority (0x" << std::hex << result << std::dec
+                  << ")\n";
+}
+
 void platform_shutdown() {
     std::fflush(stdout);
     std::fflush(stderr);
@@ -183,6 +198,8 @@ const std::vector<int> &platform_worker_cores() {
 }
 
 void platform_pin_current_thread(int) {}
+
+void platform_raise_current_thread_priority() {}
 
 void platform_shutdown() {}
 

@@ -6,6 +6,7 @@
 // camera/vehicle side channels, Project2DFX and the profile self-tests.
 // See profiles/pes6/progress/poda_hle.md for the full list.
 #include "pes6_hle.hpp"
+#include "host_platform.hpp"
 #include "pes6_runtime_log.hpp"
 #include "pes6_overlays.hpp"
 #include "pes6_fast_paths.hpp"
@@ -1195,9 +1196,15 @@ struct GeAsyncTask {
     std::uint32_t id{};
     std::int32_t submitter_uid{};
     std::shared_ptr<std::atomic<std::uint32_t>> stall;
+    std::uint64_t seq{};
+    // Callbacks the emulation thread predicted and already delivered; the
+    // worker checks its own against them. Without a prediction the emulation
+    // thread waits for the task and delivers what the worker reports.
+    std::vector<GuestCallbackInvocation> predicted;
+    bool has_prediction{};
 };
 struct GeAsyncCompletion {
-    std::int32_t submitter_uid{};
+    std::uint64_t seq{};
     std::vector<GuestCallbackInvocation> callbacks;
 };
 struct GeAsyncWorkerState {
@@ -1212,11 +1219,19 @@ struct GeAsyncWorkerState {
     std::deque<GeAsyncCompletion> completions;
     std::atomic<std::uint32_t> outstanding{0u};
     std::atomic<std::uint32_t> completion_count{0u};
+    // Host time the emulation thread spent waiting for the worker since the
+    // last vblank report (all waits: DrawSync, ListSync, vblank, ...).
     std::atomic<std::uint64_t> last_wait_ns{0u};
     std::atomic<bool> fatal{false};
     std::string fatal_reason;
     std::uint64_t submitted{};
     std::uint64_t completed{};
+    std::uint64_t skipped{};
+    std::uint64_t commands{};
+    std::uint64_t next_seq{};
+    std::uint64_t predicted{};
+    std::uint64_t unpredicted{};
+    std::uint64_t prediction_mismatches{};
     std::uint64_t wait_calls{};
     std::chrono::steady_clock::duration wait_time{};
 };
@@ -1230,18 +1245,36 @@ bool ge_async_enabled() noexcept {
         const char *value = std::getenv("PSPRECOMP_GE_ASYNC");
         return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
     }();
-    // The GL backend's context lives on the emulation thread.
-    return enabled && !ge_gpu_backend_active();
+    // With the GL backend the worker only records; the emulation thread, which
+    // owns the GL context, replays (ge_gpu_backend_seal_recording).
+    return enabled;
 }
 
 bool ge_async_running() noexcept {
     return ge_async.started.load(std::memory_order_acquire);
 }
 
+// PES6_GE_PIPELINE=1 (with PSPRECOMP_GE_ASYNC=1): sceGeDrawSync(0) returns
+// without waiting, so the GE draws frame N while the game computes frame N+1.
+// The game only needs frame N when it shows it: sceDisplaySetFrameBuf waits
+// for the GE (as do the sceGe queries and an idle scheduler). Safe for PES6
+// because the game never rewrites, between DrawSync and the next SetFrameBuf,
+// anything the GE read for that frame (PES6_GE_INPUT_CHECK over a whole match
+// and the pause screen: no byte changed).
+bool ge_pipeline_enabled() noexcept {
+    static const bool enabled = [] {
+        const char *value = std::getenv("PES6_GE_PIPELINE");
+        return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled && ge_async_enabled();
+}
+
+
+// Vblank waits since the last sceDisplaySetFrameBuf (pipelined GE).
+std::uint64_t vblanks_since_frame_buffer_set{};
+
 void ge_async_worker_main();
-void ge_async_drain_completions();
 bool ge_async_wait_idle(psprecomp::Runtime &runtime);
-bool ge_async_wait_list(psprecomp::Runtime &runtime, std::uint32_t id);
 bool ge_async_check_fatal(psprecomp::Runtime &runtime);
 void ge_async_stop_worker();
 
@@ -1449,6 +1482,16 @@ bool sched_diag_env_enabled() {
 bool ge_diag_env_enabled() {
     static const bool enabled = std::getenv("PSPRECOMP_GE_DIAG") != nullptr;
     return enabled;
+}
+// PES6_TRACE_HLE_LIBRARY=sceGe_user: log every call of that library (and,
+// for sceGe_user, every finish/signal callback as it starts), to diff two runs.
+// Lines are buffered and printed at shutdown: writing them as they happen
+// slows the emulation thread enough to hide GE worker races.
+std::string trace_hle_library;
+std::uint64_t trace_hle_library_lines{};
+std::ostringstream trace_hle_library_buffer;
+bool trace_ge_callbacks() {
+    return (trace_hle_library == "sceGe_user" || trace_hle_library == "*") && trace_hle_library_lines < 200000u;
 }
 bool event_diag_env_enabled() {
     static const bool enabled = std::getenv("PSPRECOMP_EVENT_DIAG") != nullptr;
@@ -2909,7 +2952,11 @@ auto best_ready_thread() {
         });
 }
 
-bool preempt_if_higher_priority(psprecomp::AllegrexContext &ctx, const char *reason) {
+// The caller resumes at resume_pc, $ra by default: inside an HLE handler the
+// import has not returned yet. The post-import hook passes ctx.pc when the
+// handler already sent the thread elsewhere (a callback it started).
+bool preempt_if_higher_priority(psprecomp::AllegrexContext &ctx, const char *reason,
+                                std::optional<std::uint32_t> resume_pc = std::nullopt) {
     const auto current = thread_table.threads.find(thread_table.current_uid);
     if (current == thread_table.threads.end() || current->second.state != ThreadState::Running) return false;
     const auto best = best_ready_thread();
@@ -2922,7 +2969,7 @@ bool preempt_if_higher_priority(psprecomp::AllegrexContext &ctx, const char *rea
     const std::int32_t target_uid = best->uid;
     const std::uint32_t target_priority = thread_priority(target_uid);
     psprecomp::AllegrexContext caller = ctx;
-    caller.pc = ctx.gpr[31];
+    caller.pc = resume_pc.value_or(ctx.gpr[31]);
     enqueue_continuation(caller_uid, caller);
     if (sched_diag_env_enabled() || trace_env_enabled()) {
         std::cerr << "[sched] preempt reason=" << reason
@@ -2971,13 +3018,6 @@ bool activate_next_thread(psprecomp::AllegrexContext &ctx, const char *reason) {
                        }),
         thread_table.continuations.end());
     (void)start_due_alarm_thread();
-    // Nothing runnable while the GE worker still has lists: a thread may be
-    // waiting for their callbacks. Let it finish before skipping time ahead.
-    if (thread_table.continuations.empty() && scanout_runtime != nullptr && ge_async_running() &&
-        ge_async.outstanding.load(std::memory_order_acquire) != 0u) {
-        if (!ge_async_wait_idle(*scanout_runtime)) return false;
-        (void)start_due_alarm_thread();
-    }
     if (thread_table.continuations.empty()) {
         std::uint64_t earliest = UINT64_MAX;
         for (const auto &[uid, thread] : thread_table.threads) {
@@ -3398,6 +3438,12 @@ bool start_next_guest_callback(psprecomp::AllegrexContext &ctx, bool begin_chain
     ctx.set_gpr(6, invocation.a2);
     ctx.set_gpr(31, 0x00000004u);
     ctx.pc = invocation.function;
+    if (trace_ge_callbacks()) {
+        ++trace_hle_library_lines;
+        trace_hle_library_buffer << "[lib-trace] v=" << display_vblank_index << " t=" << virtual_time_us << " uid=" << uid
+                  << " callback=" << psprecomp::hex32(invocation.function) << " a0=" << psprecomp::hex32(invocation.a0)
+                  << " a1=" << psprecomp::hex32(invocation.a1) << "\n";
+    }
     if (ge_diag_env_enabled() || sched_diag_env_enabled()) {
         std::cerr << "[callback] start uid=" << uid
                   << " function=" << psprecomp::hex32(invocation.function)
@@ -3458,14 +3504,6 @@ bool alarm_thread_busy{};
 bool alarm_thread_running_vblank{};
 std::int32_t alarm_thread_alarm_uid{};
 std::uint32_t alarm_gp{};
-// Asynchronous GE (PSPRECOMP_GE_ASYNC): finish/signal callbacks of lists the
-// worker completed. On the PSP they are interrupt handlers, so they run on the
-// interrupt thread as soon as any guest code checks in -- not on the thread
-// that enqueued the list, which PES6 puts to sleep on a semaphore that only
-// the finish callback signals (queuing them for it deadlocked the boot).
-std::deque<GuestCallbackInvocation> ge_interrupt_callbacks;
-std::uint32_t ge_callback_gp{};
-bool alarm_thread_running_ge{};
 // Sub-interrupt numbers of VBLANK handlers still to run for the current
 // vblank, in ascending order, and the last vblank (virtual time / period)
 // whose handlers were queued.
@@ -3481,7 +3519,6 @@ bool any_vblank_handler_enabled() {
 
 std::uint64_t earliest_alarm_due_us() {
     if (alarm_thread_busy) return UINT64_MAX;
-    if (!ge_interrupt_callbacks.empty()) return virtual_time_us;
     std::uint64_t earliest = UINT64_MAX;
     for (const auto &[uid, alarm] : alarms) earliest = std::min(earliest, alarm.due_us);
     if (!pending_vblank_handlers.empty()) earliest = std::min(earliest, virtual_time_us);
@@ -3526,19 +3563,6 @@ bool start_due_alarm_thread() {
         found->second.occurred = true;
         alarm_thread_running_vblank = true;
     }
-    std::uint32_t argument2 = 0u;
-    alarm_thread_running_ge = false;
-    if (handler == 0u && !ge_interrupt_callbacks.empty()) {
-        const GuestCallbackInvocation callback = ge_interrupt_callbacks.front();
-        ge_interrupt_callbacks.pop_front();
-        handler = callback.function;
-        argument0 = callback.a0;
-        argument1 = callback.a1;
-        argument2 = callback.a2;
-        gp = ge_callback_gp != 0u ? ge_callback_gp : alarm_gp;
-        alarm_thread_running_vblank = false;
-        alarm_thread_running_ge = true;
-    }
     auto due = alarms.end();
     if (handler == 0u) {
         for (auto it = alarms.begin(); it != alarms.end(); ++it) {
@@ -3565,7 +3589,6 @@ bool start_due_alarm_thread() {
     context.set_gpr(29, thread->second.stack_top - 0x40u);
     context.set_gpr(4, argument0);
     context.set_gpr(5, argument1);
-    context.set_gpr(6, argument2);
     context.set_gpr(31, 0x00000004u);
     context.pc = handler;
     alarm_thread_busy = true;
@@ -3573,9 +3596,6 @@ bool start_due_alarm_thread() {
     if (sched_diag_env_enabled()) {
         if (alarm_thread_running_vblank)
             std::cerr << "[intr] vblank sub=" << argument0 << " handler=" << psprecomp::hex32(handler)
-                      << " t=" << virtual_time_us << "\n";
-        else if (alarm_thread_running_ge)
-            std::cerr << "[intr] ge callback handler=" << psprecomp::hex32(handler)
                       << " t=" << virtual_time_us << "\n";
         else
             std::cerr << "[alarm] fire uid=" << due->first << " handler=" << psprecomp::hex32(handler)
@@ -3585,11 +3605,16 @@ bool start_due_alarm_thread() {
 }
 
 void pes6_post_import_hook(psprecomp::Runtime &runtime, psprecomp::AllegrexContext &ctx) {
-    if (ge_async_running()) {
-        ge_async_drain_completions();
-        if (!ge_async_check_fatal(runtime)) return;
-    }
-    if (start_due_alarm_thread() && preempt_if_higher_priority(ctx, "alarm")) return;
+    // Completed lists' callbacks are only collected where the guest waits for
+    // the GE (DrawSync/ListSync, vblank, an idle scheduler): picking them up
+    // whenever the worker happened to finish made every run take a different
+    // path in virtual time.
+    if (ge_async_running() && !ge_async_check_fatal(runtime)) return;
+    // A handler that redirected the thread (sceKernelCheckCallback starting a
+    // callback) must resume there, not at $ra: preempting at $ra skipped the
+    // UMD callback whenever a GE callback was waiting for the interrupt thread.
+    const std::uint32_t resume_pc = ctx.pc != runtime.current_import_pc() ? ctx.pc : ctx.gpr[31];
+    if (start_due_alarm_thread() && preempt_if_higher_priority(ctx, "alarm", resume_pc)) return;
     (void)maybe_start_pending_guest_callback(ctx);
 }
 
@@ -3623,8 +3648,10 @@ void pes6_post_dispatch_hook(psprecomp::Runtime &rt, psprecomp::AllegrexContext 
     // see each guest function entry.
     static const std::uint64_t trace_start = parse_environment_u64("PES6_TRACE_START_VBLANK", 0u);
     static const std::uint64_t trace_end = parse_environment_u64("PES6_TRACE_END_VBLANK", 0u);
+    // PES6_TRACE_UID picks the thread (default 1, user_main).
+    static const std::uint64_t trace_uid = parse_environment_u64("PES6_TRACE_UID", 1u);
     if (trace_start != 0u && display_vblank_index >= trace_start && display_vblank_index <= trace_end &&
-        dispatch_thread_uid == 1)
+        dispatch_thread_uid == static_cast<std::int32_t>(trace_uid))
         std::cerr << "[trace] v=" << display_vblank_index << " pc=" << psprecomp::hex32(dispatch_pc) << "\n";
     static const std::uint64_t pc_profile_start = parse_environment_u64("PES6_PC_PROFILE_START_VBLANK", 0u);
     if (pc_profile_enabled()) {
@@ -3932,6 +3959,363 @@ void limit_frame_rate() {
     while (std::chrono::steady_clock::now() < target) std::this_thread::yield();
 }
 
+// Asynchronous GE: the guest must see what the synchronous GE shows it, where
+// a list has run by the time sceGeListEnQueue returns and its finish/signal
+// callbacks run on the enqueuing thread right away (PES6's finish callback
+// stores the token of the last list the GE finished, and a memory manager
+// frees buffers by it; delivering the callbacks later sent the game down a
+// different path). The callbacks depend only on the list's control flow, so
+// the emulation thread walks it -- jumps, calls, returns, BASE/OFFSET/ORIGIN,
+// SIGNAL/FINISH/END, the way execute_ge_list does -- and delivers them at
+// enqueue; the worker then draws in the background and checks its own
+// callbacks against the prediction. ge_predict is the control state the walk
+// carries from list to list; it is reset from ge_state whenever the GE is idle.
+struct GePredictState {
+    std::uint32_t base_command{};
+    std::uint32_t offset{};
+};
+GePredictState ge_predict{};
+
+void ge_predict_resync() {
+    ge_predict.base_command = ge_state.commands[kGeCommandBase];
+    ge_predict.offset = ge_state.offset_address;
+}
+
+std::uint32_t ge_predict_relative(std::uint32_t data) {
+    const std::uint32_t base_extended = ((ge_predict.base_command & 0x000F0000u) << 8u) | (data & 0x00FFFFFFu);
+    return (ge_predict.offset + base_extended) & 0x0FFFFFFFu;
+}
+
+// False when the outcome depends on what only the GE knows (a stall, BJUMP
+// after a bounding-box test) or on an error; the caller then waits for the
+// worker and delivers its callbacks instead.
+bool predict_ge_list_callbacks(psprecomp::GuestMemory &memory, GeListRecord list,
+                               std::vector<GuestCallbackInvocation> &callbacks) {
+    if (list.stall != 0u) return false;
+    // Only these commands change control flow or the state it depends on;
+    // the walk skips every other word in a tight loop (a frame is thousands
+    // of state commands and a handful of these).
+    static constexpr std::array<bool, 256> kControl = [] {
+        std::array<bool, 256> table{};
+        for (const std::uint32_t command : {kGeCommandJump, kGeCommandBoundingBoxJump, kGeCommandCall,
+                                            kGeCommandReturn, kGeCommandEnd, kGeCommandBase,
+                                            kGeCommandOffsetAddress, kGeCommandOrigin})
+            table[command] = true;
+        return table;
+    }();
+    static_assert(std::endian::native == std::endian::little, "the walk reads the command byte directly");
+    const std::uint8_t *window = nullptr;
+    std::uint32_t window_base = 0u;
+    std::uint32_t window_bytes = 0u;
+    std::uint64_t executed = 0u;
+    while (executed < 4'000'000u) {
+        std::uint32_t pc = list.pc;
+        if ((pc & 3u) != 0u) return false;
+        if (window == nullptr || pc < window_base || pc - window_base > window_bytes - 4u) {
+            window = nullptr;
+            for (const std::uint32_t bytes : {65536u, 4096u, 256u, 4u}) {
+                if (const std::uint8_t *pointer = memory.raw_pointer(pc, bytes)) {
+                    window = pointer;
+                    window_base = pc;
+                    window_bytes = bytes;
+                    break;
+                }
+            }
+            if (window == nullptr) return false;
+        }
+        const std::uint8_t *word = window + (pc - window_base);
+        const std::uint8_t *const window_end = window + window_bytes - 3u;
+        const std::uint8_t *const start = word;
+        while (word < window_end && !kControl[word[3]]) word += 4;
+        executed += static_cast<std::uint64_t>(word - start) / 4u;
+        pc = window_base + static_cast<std::uint32_t>(word - window);
+        list.pc = pc & 0x0FFFFFFFu;
+        if (word >= window_end) continue;  // past this window: fetch the next
+        ++executed;
+        std::uint32_t op{};
+        std::memcpy(&op, word, sizeof(op));
+        const std::uint32_t command = op >> 24u;
+        const std::uint32_t data = op & 0x00FFFFFFu;
+        std::uint32_t next_pc = (pc + 4u) & 0x0FFFFFFFu;
+        switch (command) {
+        case kGeCommandBase:
+            ge_predict.base_command = op;
+            break;
+        case kGeCommandOffsetAddress:
+            ge_predict.offset = op << 8u;
+            break;
+        case kGeCommandOrigin:
+            ge_predict.offset = pc;
+            break;
+        case kGeCommandJump:
+            next_pc = ge_predict_relative(data & 0x00FFFFFCu);
+            break;
+        case kGeCommandBoundingBoxJump:
+            return false;
+        case kGeCommandCall:
+            if (list.stack.size() >= list.stack_capacity) return false;
+            list.stack.push_back(GeStackEntry{next_pc, ge_predict.offset, ge_predict.base_command});
+            next_pc = ge_predict_relative(data & 0x00FFFFFCu);
+            break;
+        case kGeCommandReturn: {
+            if (list.stack.empty()) return false;
+            const GeStackEntry entry = list.stack.back();
+            list.stack.pop_back();
+            ge_predict.offset = entry.offset_address;
+            next_pc = entry.pc & 0x0FFFFFFFu;
+            break;
+        }
+        case kGeCommandEnd: {
+            if (pc < 4u || !memory.contains(pc - 4u, 4u)) break;
+            const std::uint32_t previous = memory.load32(pc - 4u);
+            const std::uint32_t previous_command = previous >> 24u;
+            if (previous_command == kGeCommandSignal) {
+                const std::uint8_t behavior = static_cast<std::uint8_t>((previous >> 16u) & 0xFFu);
+                const std::uint16_t token = static_cast<std::uint16_t>(previous & 0xFFFFu);
+                const std::uint32_t combined =
+                    ((static_cast<std::uint32_t>(token) << 16u) | (op & 0xFFFFu)) & 0x0FFFFFFCu;
+                list.signal_behavior = behavior;
+                switch (behavior) {
+                case kGeSignalHandlerSuspend:
+                case kGeSignalHandlerContinue:
+                    (void)append_ge_callback(list, true, token, next_pc, callbacks);
+                    break;
+                case kGeSignalHandlerPause:
+                case kGeSignalSync:
+                    break;
+                case kGeSignalJump:
+                    next_pc = combined;
+                    break;
+                case kGeSignalRelativeJump:
+                    next_pc = (combined + pc - 4u) & 0x0FFFFFFFu;
+                    break;
+                case kGeSignalOriginJump:
+                    next_pc = ge_predict_relative(combined);
+                    break;
+                case kGeSignalCall:
+                case kGeSignalRelativeCall:
+                case kGeSignalOriginCall: {
+                    if (list.stack.size() >= list.stack_capacity) return false;
+                    std::uint32_t target = combined;
+                    if (behavior == kGeSignalRelativeCall) target = (combined + pc - 4u) & 0x0FFFFFFFu;
+                    else if (behavior == kGeSignalOriginCall) target = ge_predict_relative(combined);
+                    list.stack.push_back(GeStackEntry{next_pc, ge_predict.offset, ge_predict.base_command});
+                    next_pc = target;
+                    break;
+                }
+                case kGeSignalReturn: {
+                    if (list.stack.empty()) return false;
+                    const GeStackEntry entry = list.stack.back();
+                    list.stack.pop_back();
+                    ge_predict.offset = entry.offset_address;
+                    ge_predict.base_command = entry.base_command;
+                    next_pc = entry.pc & 0x0FFFFFFFu;
+                    break;
+                }
+                default:
+                    return false;
+                }
+            } else if (previous_command == kGeCommandFinish) {
+                const std::uint16_t token = static_cast<std::uint16_t>(previous & 0xFFFFu);
+                if (list.signal_behavior == kGeSignalHandlerPause) {
+                    (void)append_ge_callback(list, true, token, next_pc, callbacks);
+                } else {
+                    if (list.has_saved_context) {
+                        ge_predict.base_command = list.saved_commands[kGeCommandBase];
+                        ge_predict.offset = list.saved_offset_address;
+                    }
+                    (void)append_ge_callback(list, false, token, next_pc, callbacks);
+                }
+                return true;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+        list.pc = next_pc;
+    }
+    return false;
+}
+
+// PES6_GE_INPUT_CHECK=1 (diagnostic, synchronous GE): would a pipelined GE be
+// safe? Every guest range the GE reads -- command words, vertices, indices,
+// texture levels, CLUTs -- is recorded until sceGeDrawSync(0), hashed there,
+// and hashed again where a GE still running in the background would have to
+// be done: the next list enqueue or sceDisplaySetFrameBuf. A difference means
+// the game rewrote GE input in between (with the GE overlapping that stretch,
+// it would have read the new bytes).
+enum class GeInputKind : std::uint8_t { Commands, Vertices, Indices, Texture, Clut, Count };
+constexpr std::array<const char *, 5> kGeInputKindNames{"cmd", "vtx", "idx", "tex", "clut"};
+struct GeInputRange {
+    std::uint32_t begin{};
+    std::uint32_t end{};
+    std::uint64_t hash{};
+};
+struct GeInputCheck {
+    bool enabled{};
+    std::array<std::vector<GeInputRange>, static_cast<std::size_t>(GeInputKind::Count)> recording;
+    std::array<std::vector<GeInputRange>, static_cast<std::size_t>(GeInputKind::Count)> sealed;
+    bool pending{};
+    std::uint32_t run_begin{};
+    std::uint32_t run_end{};
+    std::uint64_t sealed_vblank{};
+    std::uint64_t frames_checked{};
+    std::uint64_t frames_changed{};
+    std::array<std::uint64_t, static_cast<std::size_t>(GeInputKind::Count)> changed_frames_by_kind{};
+    std::array<std::uint64_t, static_cast<std::size_t>(GeInputKind::Count)> changed_bytes_by_kind{};
+    std::array<std::uint64_t, static_cast<std::size_t>(GeInputKind::Count)> watched_bytes_by_kind{};
+    std::uint64_t reports{};
+};
+GeInputCheck ge_input_check{};
+
+void ge_input_note(GeInputKind kind, std::uint32_t begin, std::uint32_t bytes) {
+    if (bytes == 0u) return;
+    begin &= 0x0FFFFFFFu;
+    ge_input_check.recording[static_cast<std::size_t>(kind)].push_back({begin, begin + bytes, 0u});
+}
+
+void ge_input_note_command(std::uint32_t pc) {
+    if (pc == ge_input_check.run_end && ge_input_check.run_end != 0u) {
+        ge_input_check.run_end = pc + 4u;
+        return;
+    }
+    if (ge_input_check.run_end != 0u)
+        ge_input_note(GeInputKind::Commands, ge_input_check.run_begin,
+                      ge_input_check.run_end - ge_input_check.run_begin);
+    ge_input_check.run_begin = pc;
+    ge_input_check.run_end = pc + 4u;
+}
+
+std::uint64_t ge_input_hash(const psprecomp::GuestMemory &memory, std::uint32_t begin, std::uint32_t end) {
+    std::uint64_t hash = 1469598103934665603ull;
+    for (std::uint32_t address = begin; address < end;) {
+        const std::uint32_t chunk = std::min<std::uint32_t>(end - address, 4096u - (address & 4095u));
+        const std::uint8_t *bytes = memory.raw_pointer(address, chunk);
+        if (bytes == nullptr) return 0u;
+        for (std::uint32_t i = 0; i < chunk; ++i) hash = (hash ^ bytes[i]) * 1099511628211ull;
+        address += chunk;
+    }
+    return hash;
+}
+
+// sceGeDrawSync(0): the GE has finished everything recorded so far.
+void ge_input_seal(const psprecomp::GuestMemory &memory) {
+    if (ge_input_check.run_end != 0u) {
+        ge_input_note(GeInputKind::Commands, ge_input_check.run_begin,
+                      ge_input_check.run_end - ge_input_check.run_begin);
+        ge_input_check.run_end = 0u;
+    }
+    for (std::size_t kind = 0; kind < ge_input_check.recording.size(); ++kind) {
+        auto &ranges = ge_input_check.recording[kind];
+        std::sort(ranges.begin(), ranges.end(), [](const auto &a, const auto &b) { return a.begin < b.begin; });
+        auto &merged = ge_input_check.sealed[kind];
+        merged.clear();
+        for (const GeInputRange &range : ranges) {
+            if (!merged.empty() && range.begin <= merged.back().end)
+                merged.back().end = std::max(merged.back().end, range.end);
+            else
+                merged.push_back(range);
+        }
+        ranges.clear();
+        for (GeInputRange &range : merged) range.hash = ge_input_hash(memory, range.begin, range.end);
+    }
+    ge_input_check.pending = true;
+    ge_input_check.sealed_vblank = display_vblank_index;
+}
+
+// Where a pipelined GE would have had to be finished.
+void ge_input_verify(const psprecomp::GuestMemory &memory, const char *where) {
+    if (!ge_input_check.pending) return;
+    ge_input_check.pending = false;
+    ++ge_input_check.frames_checked;
+    bool any = false;
+    std::ostringstream detail;
+    for (std::size_t kind = 0; kind < ge_input_check.sealed.size(); ++kind) {
+        std::uint64_t changed_ranges = 0u, changed_bytes = 0u, total_bytes = 0u;
+        const GeInputRange *first = nullptr;
+        for (const GeInputRange &range : ge_input_check.sealed[kind]) {
+            total_bytes += range.end - range.begin;
+            ge_input_check.watched_bytes_by_kind[kind] += range.end - range.begin;
+            if (ge_input_hash(memory, range.begin, range.end) == range.hash) continue;
+            ++changed_ranges;
+            changed_bytes += range.end - range.begin;
+            if (first == nullptr) first = &range;
+        }
+        if (changed_ranges == 0u) continue;
+        any = true;
+        ++ge_input_check.changed_frames_by_kind[kind];
+        ge_input_check.changed_bytes_by_kind[kind] += changed_bytes;
+        detail << ' ' << kGeInputKindNames[kind] << '=' << changed_ranges << '/' << ge_input_check.sealed[kind].size()
+               << " (" << changed_bytes << '/' << total_bytes << " B, first " << psprecomp::hex32(first->begin)
+               << '+' << (first->end - first->begin) << ')';
+    }
+    if (!any) return;
+    ++ge_input_check.frames_changed;
+    if (ge_input_check.reports++ < 200u)
+        std::cerr << "[ge-input] sealed v=" << ge_input_check.sealed_vblank << " checked v=" << display_vblank_index
+                  << " at " << where << detail.str() << "\n";
+}
+
+std::uint32_t ge_vertex_size(std::uint32_t vtype) {
+    const auto align = [](std::uint32_t offset, std::uint32_t to) { return to <= 1u ? offset : (offset + to - 1u) & ~(to - 1u); };
+    std::uint32_t size = 0u, largest = 1u;
+    const auto add = [&](std::uint32_t component, std::uint32_t count) {
+        if (component == 0u) return;
+        size = align(size, component) + component * count;
+        largest = std::max(largest, component);
+    };
+    static constexpr std::array<std::uint32_t, 4> kScalar{0u, 1u, 2u, 4u};
+    add(kScalar[(vtype >> 9u) & 3u], ((vtype >> 14u) & 7u) + 1u);       // weights
+    add(kScalar[vtype & 3u], 2u);                                       // texture coordinates
+    static constexpr std::array<std::uint32_t, 8> kColor{0u, 0u, 0u, 0u, 2u, 2u, 2u, 4u};
+    add(kColor[(vtype >> 2u) & 7u], 1u);                                // colour
+    add(kScalar[(vtype >> 5u) & 3u], 3u);                               // normal
+    add(kScalar[(vtype >> 7u) & 3u], 3u);                               // position
+    return align(size, largest) * (((vtype >> 18u) & 7u) + 1u);         // morph targets
+}
+
+void ge_input_note_draw(const psprecomp::GuestMemory &memory, const std::array<std::uint32_t, 256> &commands,
+                        std::uint32_t vertex_address, std::uint32_t index_address, std::uint32_t render_data,
+                        std::uint32_t next_vertex_address, std::uint32_t next_index_address) {
+    const std::uint32_t vtype = commands[0x12u] & 0x00FFFFFFu;
+    const std::uint32_t count = render_data & 0xFFFFu;
+    const std::uint32_t index_format = (vtype >> 11u) & 3u;
+    const std::uint32_t vertex_bytes = ge_vertex_size(vtype);
+    if (index_format == 0u) {
+        ge_input_note(GeInputKind::Vertices, vertex_address,
+                      next_vertex_address > vertex_address ? next_vertex_address - vertex_address : count * vertex_bytes);
+    } else {
+        const std::uint32_t index_bytes = index_format == 1u ? 1u : (index_format == 2u ? 2u : 4u);
+        const std::uint32_t indices = index_bytes * count;
+        ge_input_note(GeInputKind::Indices, index_address,
+                      next_index_address > index_address ? next_index_address - index_address : indices);
+        std::uint32_t low = 0xFFFFFFFFu, high = 0u;
+        if (const std::uint8_t *raw = memory.raw_pointer(index_address & 0x0FFFFFFFu, indices); raw != nullptr) {
+            for (std::uint32_t i = 0; i < count; ++i) {
+                std::uint32_t value = raw[i * index_bytes];
+                if (index_bytes >= 2u) value |= static_cast<std::uint32_t>(raw[i * index_bytes + 1u]) << 8u;
+                low = std::min(low, value);
+                high = std::max(high, value);
+            }
+        }
+        if (low <= high)
+            ge_input_note(GeInputKind::Vertices, vertex_address + low * vertex_bytes, (high - low + 1u) * vertex_bytes);
+    }
+    if ((commands[0x1Eu] & 1u) == 0u) return;
+    const std::uint32_t format = commands[0xC3u] & 0xFu;
+    // Bits per texel: 5650/5551/4444, 8888, T4, T8, T16, T32, DXT1, DXT3, DXT5.
+    static constexpr std::array<std::uint32_t, 11> kBits{16u, 16u, 16u, 32u, 4u, 8u, 16u, 32u, 4u, 8u, 8u};
+    if (format >= kBits.size()) return;
+    const std::uint32_t max_level = (commands[0xC2u] >> 16u) & 7u;
+    for (std::uint32_t level = 0u; level <= max_level; ++level) {
+        const std::uint32_t address = (commands[0xA0u + level] & 0x00FFFFF0u) | ((commands[0xA8u + level] & 0x000F0000u) << 8u);
+        const std::uint32_t buffer_width = commands[0xA8u + level] & 0x07FFu;
+        const std::uint32_t height = 1u << ((commands[0xB8u + level] >> 8u) & 0xFu);
+        ge_input_note(GeInputKind::Texture, address, buffer_width * height * kBits[format] / 8u);
+    }
+}
+
 bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
                      std::vector<GuestCallbackInvocation> &callbacks,
                      const std::atomic<std::uint32_t> *async_stall = nullptr) {
@@ -4014,6 +4398,7 @@ bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
         }
 
         const std::uint32_t op_pc = list.pc;
+        if (ge_input_check.enabled) ge_input_note_command(op_pc);
         const std::uint32_t command = op >> 24u;
         const std::uint32_t data = op & 0x00FFFFFFu;
         const std::uint32_t previous_command = ge_state.commands[command];
@@ -4023,7 +4408,13 @@ bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
         if (op != previous_command && ge_command_affects_lighting(command))
             ++ge_lighting_state_revision;
         // CLOAD snapshots the palette even when the command word repeats.
-        if (command == kGeCommandLoadClut) note_ge_clut_load();
+        if (command == kGeCommandLoadClut) {
+            note_ge_clut_load();
+            if (ge_input_check.enabled)
+                ge_input_note(GeInputKind::Clut,
+                              (ge_state.commands[0xB0u] & 0x00FFFFF0u) | ((ge_state.commands[0xB1u] & 0x000F0000u) << 8u),
+                              (data & 0x3Fu) * 32u);
+        }
         // Camera matrices are streaming DATA registers: even an identical 24-bit
         // payload advances the cursor and can update a different matrix element.
         // View/projection cursor/data therefore always advance the camera
@@ -4090,6 +4481,7 @@ bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
                     if (count_ge_commands) ++ge_commands_this_vblank;
                     if (ge_histogram) ++list.primitive_commands;
                     ge_state.commands[kGeCommandPrimitive] = next_op;
+                    if (ge_input_check.enabled) ge_input_note_command(cursor);
                     cursor = (cursor + 4u) & 0x0FFFFFFFu;
                 }
                 if (logical_primitive_count > 1u) {
@@ -4117,6 +4509,9 @@ bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
                 ge_execution_stop(runtime, "GE rasterizer failed at " + psprecomp::hex32(op_pc) + ": " + render_error);
                 return false;
             }
+            if (ge_input_check.enabled)
+                ge_input_note_draw(runtime.memory(), ge_state.commands, draw_vertex_address, draw_index_address,
+                                   render_data, render_stats.next_vertex_address, render_stats.next_index_address);
             ge_state.vertex_address = render_stats.next_vertex_address;
             ge_state.index_address = render_stats.next_index_address;
             // Read once: this sits on the per-draw-call path, and getenv walks
@@ -4401,6 +4796,11 @@ bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
 
 void ge_async_worker_main() {
     ge_async_worker_thread = true;
+    // Switch: off the emulation core (the audio feeder takes the last one).
+    if (const auto &cores = pes6::platform_worker_cores(); !cores.empty()) {
+        pes6::platform_pin_current_thread(cores.front());
+        pes6::platform_raise_current_thread_priority();
+    }
     for (;;) {
         GeAsyncTask task{};
         GeListRecord local{};
@@ -4417,6 +4817,7 @@ void ge_async_worker_main() {
                 found->second.state == GeListState::None ||
                 found->second.state == GeListState::Completed ||
                 found->second.state == GeListState::Error) {
+                ++ge_async.skipped;
                 ge_async.live_stalls.erase(task.id);
                 ge_async.outstanding.fetch_sub(1u, std::memory_order_acq_rel);
                 ge_async.cv.notify_all();
@@ -4428,18 +4829,38 @@ void ge_async_worker_main() {
         }
 
         std::vector<GuestCallbackInvocation> callbacks;
-        const bool ok = execute_ge_list(*runtime, local, callbacks, task.stall.get());
+        const std::uint64_t commands_before = local.executed_commands;
+        bool ok = execute_ge_list(*runtime, local, callbacks, task.stall.get());
 
         {
-            std::lock_guard lock(ge_async.mutex);
+            std::unique_lock lock(ge_async.mutex);
+            // sceGeListUpdateStallAddr may have moved the stall after the
+            // worker stopped at the old one but before this lock: it saw the
+            // list still live and only updated the atomic. Keep going.
+            while (ok && local.state == GeListState::Stalled &&
+                   task.stall->load(std::memory_order_acquire) != local.pc) {
+                lock.unlock();
+                ok = execute_ge_list(*runtime, local, callbacks, task.stall.get());
+                lock.lock();
+            }
             const auto found = ge_list_table.lists.find(task.id);
             if (found != ge_list_table.lists.end()) found->second = std::move(local);
             ge_async.live_stalls.erase(task.id);
-            if (!callbacks.empty()) {
-                ge_async.completions.push_back(GeAsyncCompletion{task.submitter_uid, std::move(callbacks)});
+            if (!task.has_prediction) {
+                ge_async.completions.push_back(GeAsyncCompletion{task.seq, std::move(callbacks)});
                 ge_async.completion_count.fetch_add(1u, std::memory_order_release);
+            } else if (callbacks.size() != task.predicted.size() ||
+                       !std::equal(callbacks.begin(), callbacks.end(), task.predicted.begin(),
+                                   [](const GuestCallbackInvocation &a, const GuestCallbackInvocation &b) {
+                                       return a.function == b.function && a.a0 == b.a0 && a.a1 == b.a1 &&
+                                              a.a2 == b.a2;
+                                   })) {
+                if (ge_async.prediction_mismatches++ < 20u)
+                    std::cerr << "[ge-async] callback prediction mismatch list=" << psprecomp::hex32(task.id)
+                              << " predicted=" << task.predicted.size() << " actual=" << callbacks.size() << "\n";
             }
             ++ge_async.completed;
+            ge_async.commands += local.executed_commands - commands_before;
             ge_async.outstanding.fetch_sub(1u, std::memory_order_acq_rel);
             if (!ok && !ge_async.fatal.load(std::memory_order_acquire)) {
                 ge_async.fatal_reason = "Asynchronous GE display-list execution failed";
@@ -4472,22 +4893,6 @@ void ge_async_stop_worker() {
     ge_async.last_wait_ns.store(0u, std::memory_order_release);
 }
 
-void ge_async_drain_completions() {
-    if (!ge_async_enabled() || ge_async.completion_count.load(std::memory_order_acquire) == 0u) return;
-    std::deque<GeAsyncCompletion> ready;
-    {
-        std::lock_guard lock(ge_async.mutex);
-        ready.swap(ge_async.completions);
-        ge_async.completion_count.store(0u, std::memory_order_release);
-    }
-    while (!ready.empty()) {
-        GeAsyncCompletion completion = std::move(ready.front());
-        ready.pop_front();
-        for (const GuestCallbackInvocation &callback : completion.callbacks)
-            if (callback.function != 0u) ge_interrupt_callbacks.push_back(callback);
-    }
-}
-
 bool ge_async_check_fatal(psprecomp::Runtime &runtime) {
     if (!ge_async.fatal.load(std::memory_order_acquire)) return true;
     std::string reason;
@@ -4499,15 +4904,12 @@ bool ge_async_check_fatal(psprecomp::Runtime &runtime) {
     return false;
 }
 
+// Waits until the worker has run every submitted list. Host time only: the
+// guest-visible results of a list (its callbacks) were settled at enqueue.
 bool ge_async_wait_idle(psprecomp::Runtime &runtime) {
     if (!ge_async_enabled() || !ge_async.started.load(std::memory_order_acquire)) return true;
-    if (ge_async.outstanding.load(std::memory_order_acquire) == 0u) {
-        ge_async.last_wait_ns.store(0u, std::memory_order_release);
-        ge_async_drain_completions();
-        return ge_async_check_fatal(runtime);
-    }
-    const auto begin = std::chrono::steady_clock::now();
-    {
+    if (ge_async.outstanding.load(std::memory_order_acquire) != 0u) {
+        const auto begin = std::chrono::steady_clock::now();
         std::unique_lock lock(ge_async.mutex);
         ++ge_async.wait_calls;
         ge_async.cv.wait(lock, [] {
@@ -4515,13 +4917,30 @@ bool ge_async_wait_idle(psprecomp::Runtime &runtime) {
         });
         const auto elapsed = std::chrono::steady_clock::now() - begin;
         ge_async.wait_time += elapsed;
-        ge_async.last_wait_ns.store(
+        ge_async.last_wait_ns.fetch_add(
             static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
-            std::memory_order_release);
+            std::memory_order_acq_rel);
     }
     runtime.memory().memory_barrier();
-    ge_async_drain_completions();
+    ge_predict_resync();
     return ge_async_check_fatal(runtime);
+}
+
+// After a wait: the callbacks the worker reported for one unpredicted task.
+std::vector<GuestCallbackInvocation> ge_async_take_callbacks(std::uint64_t seq) {
+    std::lock_guard lock(ge_async.mutex);
+    std::vector<GuestCallbackInvocation> callbacks;
+    for (auto it = ge_async.completions.begin(); it != ge_async.completions.end();) {
+        if (it->seq == seq) {
+            callbacks.insert(callbacks.end(), it->callbacks.begin(), it->callbacks.end());
+            it = ge_async.completions.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    ge_async.completion_count.store(static_cast<std::uint32_t>(ge_async.completions.size()),
+                                    std::memory_order_release);
+    return callbacks;
 }
 
 // The PSP scans the display out every vblank whether or not a thread waits for
@@ -4541,10 +4960,9 @@ void passive_scanout_if_due() {
     const std::uint64_t tick = virtual_time_us / virtual_vblank_period_us();
     if (tick < last_present_tick + 2u) return;
     if (display_state.frame_buffer == 0u || display_state.width == 0u || display_state.height == 0u) return;
-    // Never block the scheduler on the GE worker; the next switch retries.
-    if (ge_async_enabled() && ge_async.started.load(std::memory_order_acquire) &&
-        ge_async.outstanding.load(std::memory_order_acquire) != 0u) return;
     psprecomp::Runtime &rt = *scanout_runtime;
+    // Only host time: the recording side must be idle to be sealed.
+    if (!ge_async_wait_idle(rt)) return;
     // Mark the previous period as shown: a vblank wait later in this one still
     // presents, and the next passive present can come one period from now.
     last_present_tick = tick - 1u;
@@ -4557,6 +4975,7 @@ void passive_scanout_if_due() {
         display_state.buffer_width,
         display_state.pixel_format,
     };
+    ge_gpu_backend_seal_recording();
     (void)ge_gpu_backend_finish_color_frame(display_vblank_index);
     capture_frame_if_requested(rt.memory(), displayed);
     ge_gpu_backend_set_display_framebuffer(display_state.frame_buffer);
@@ -4566,25 +4985,6 @@ void passive_scanout_if_due() {
     ++software_presents;
     display_window_present(rt.memory(), displayed);
     limit_frame_rate();
-}
-
-bool ge_async_wait_list(psprecomp::Runtime &runtime, std::uint32_t id) {
-    if (!ge_async_enabled() || !ge_async.started.load(std::memory_order_acquire)) return true;
-    const auto begin = std::chrono::steady_clock::now();
-    {
-        std::unique_lock lock(ge_async.mutex);
-        ++ge_async.wait_calls;
-        ge_async.cv.wait(lock, [id] {
-            const auto found = ge_list_table.lists.find(id);
-            if (found == ge_list_table.lists.end()) return true;
-            return found->second.state != GeListState::Queued &&
-                   found->second.state != GeListState::Running;
-        });
-        ge_async.wait_time += std::chrono::steady_clock::now() - begin;
-    }
-    runtime.memory().memory_barrier();
-    ge_async_drain_completions();
-    return ge_async_check_fatal(runtime);
 }
 
 std::uint32_t allocate_ge_list_id() {
@@ -4603,6 +5003,7 @@ std::uint32_t allocate_ge_list_id() {
 
 
 void enqueue_ge_display_list(psprecomp::Runtime &runtime, psprecomp::AllegrexContext &ctx, bool head) {
+    if (ge_input_check.enabled) ge_input_verify(runtime.memory(), "enqueue");
     const std::uint32_t list_address = ctx.gpr[4] & 0x0FFFFFFFu;
     const std::uint32_t stall_address = ctx.gpr[5] & 0x0FFFFFFFu;
     const std::int32_t callback_id = static_cast<std::int32_t>(ctx.gpr[6]);
@@ -4662,9 +5063,28 @@ void enqueue_ge_display_list(psprecomp::Runtime &runtime, psprecomp::AllegrexCon
         // normal VCS gameplay lists stay fully asynchronous.
         if (record.context_address != 0u && !ge_async_wait_idle(runtime)) return;
         ge_async_start_worker(runtime);
+        // In synchronous mode every list has completed by the time the next
+        // one is enqueued. Keep the two guest-visible consequences the same:
+        // re-enqueueing a list address that is still queued would fail, and a
+        // busy ID slot would hand out a different ID.
+        bool must_wait = false;
+        {
+            std::lock_guard lock(ge_async.mutex);
+            const auto busy = [](const GeListRecord &list) {
+                return list.state == GeListState::Queued || list.state == GeListState::Running;
+            };
+            for (const auto &[id, active] : ge_list_table.lists) {
+                (void)id;
+                if (active.start_pc == list_address && busy(active)) must_wait = true;
+            }
+            const auto slot = ge_list_table.lists.find(kGeListIdMagic ^ ge_list_table.next_raw_id);
+            if (slot != ge_list_table.lists.end() && busy(slot->second)) must_wait = true;
+        }
+        if (must_wait && !ge_async_wait_idle(runtime)) return;
 
         std::uint32_t guest_id = 0u;
-        std::uint32_t log_stack = record.stack_capacity;
+        const std::uint32_t log_stack = record.stack_capacity;
+        GeListRecord to_predict{};
         {
             std::lock_guard lock(ge_async.mutex);
             for (const auto &[id, active] : ge_list_table.lists) {
@@ -4682,23 +5102,31 @@ void enqueue_ge_display_list(psprecomp::Runtime &runtime, psprecomp::AllegrexCon
             }
             record.guest_id = guest_id;
             if (record.context_address != 0u) save_ge_list_context(runtime, record);
-
-            auto [found, inserted] = ge_list_table.lists.insert_or_assign(guest_id, std::move(record));
-            (void)inserted;
+            to_predict = record;
+            ge_list_table.lists.insert_or_assign(guest_id, std::move(record));
             if (head)
                 ge_list_table.queue.insert(ge_list_table.queue.begin(), guest_id);
             else
                 ge_list_table.queue.push_back(guest_id);
+        }
 
+        std::vector<GuestCallbackInvocation> callbacks;
+        const bool predicted = predict_ge_list_callbacks(runtime.memory(), std::move(to_predict), callbacks);
+        std::uint64_t seq = 0u;
+        {
+            std::lock_guard lock(ge_async.mutex);
+            const auto found = ge_list_table.lists.find(guest_id);
             auto stall = std::make_shared<std::atomic<std::uint32_t>>(found->second.stall);
             ge_async.live_stalls[guest_id] = stall;
-            GeAsyncTask task{guest_id, thread_table.current_uid, stall};
-            if (head)
-                ge_async.pending.push_front(std::move(task));
-            else
-                ge_async.pending.push_back(std::move(task));
+            seq = ++ge_async.next_seq;
+            // Lists run in submission order, as the synchronous GE runs them
+            // (an enqueue at the head has nothing queued to jump over there).
+            ge_async.pending.push_back(GeAsyncTask{guest_id, thread_table.current_uid, stall, seq,
+                                                   predicted ? callbacks : std::vector<GuestCallbackInvocation>{},
+                                                   predicted});
             ge_async.outstanding.fetch_add(1u, std::memory_order_release);
             ++ge_async.submitted;
+            ++(predicted ? ge_async.predicted : ge_async.unpredicted);
         }
 
         if (ge_histogram_diag_enabled()) {
@@ -4707,11 +5135,19 @@ void enqueue_ge_display_list(psprecomp::Runtime &runtime, psprecomp::AllegrexCon
                       << " stall=" << psprecomp::hex32(stall_address)
                       << " cbid=" << callback_id
                       << " option=" << psprecomp::hex32(option_address)
-                      << " stack=" << log_stack << "\n";
+                      << " stack=" << log_stack
+                      << " predicted=" << predicted << "\n";
         }
         runtime.memory().memory_barrier();
         ge_async.cv.notify_one();
-        ctx.set_gpr(2, guest_id);
+        if (!predicted) {
+            if (!ge_async_wait_idle(runtime)) return;
+            callbacks = ge_async_take_callbacks(seq);
+        }
+        psprecomp::AllegrexContext resume = ctx;
+        resume.set_gpr(2, guest_id);
+        resume.pc = ctx.gpr[31];
+        queue_guest_callback_chain(ctx, resume, std::move(callbacks));
         return;
     }
 
@@ -4845,9 +5281,7 @@ bool continue_mpeg_ringbuffer_callback(psprecomp::Runtime &runtime,
 
 void pes6_interrupt_return(psprecomp::Runtime &runtime, psprecomp::AllegrexContext &ctx) {
     if (thread_table.current_uid == kAlarmThreadUid) {
-        if (alarm_thread_running_ge) {
-            alarm_thread_running_ge = false;  // popped when it started
-        } else if (alarm_thread_running_vblank) {
+        if (alarm_thread_running_vblank) {
             if (!pending_vblank_handlers.empty()) pending_vblank_handlers.pop_front();
         } else {
             const std::uint32_t rearm_us = ctx.gpr[2];
@@ -5260,6 +5694,17 @@ void flight_recorder_observer(psprecomp::Runtime &, std::string_view library, st
         std::cerr << "[sema-trace] v=" << display_vblank_index << " uid=" << thread_uid << " nid="
                   << psprecomp::hex32(nid) << " obj=" << psprecomp::hex32(a0) << " a1=" << psprecomp::hex32(a1)
                   << " -> " << psprecomp::hex32(result) << "\n";
+    // "*" traces every library; PES6_TRACE_HLE_FROM/TO_VBLANK narrow the window.
+    static const std::uint64_t trace_from = parse_environment_u64("PES6_TRACE_HLE_FROM_VBLANK", 0u);
+    static const std::uint64_t trace_to = parse_environment_u64("PES6_TRACE_HLE_TO_VBLANK", UINT64_MAX);
+    if (!trace_hle_library.empty() && (trace_hle_library == "*" || library == trace_hle_library) &&
+        display_vblank_index >= trace_from && display_vblank_index <= trace_to &&
+        trace_hle_library_lines < 200000u) {
+        ++trace_hle_library_lines;
+        trace_hle_library_buffer << "[lib-trace] v=" << display_vblank_index << " t=" << virtual_time_us << " uid=" << thread_uid
+                  << " " << library << ":" << psprecomp::hex32(nid) << " a0=" << psprecomp::hex32(a0)
+                  << " a1=" << psprecomp::hex32(a1) << " -> " << psprecomp::hex32(result) << "\n";
+    }
     if (trace_hle_vblank != 0u && display_vblank_index == trace_hle_vblank) {
         static std::uint32_t traced = 0u;
         if (traced++ < 20000u)
@@ -5305,7 +5750,11 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
     }
     trace_hle_vblank = parse_environment_u64("PES6_TRACE_HLE_VBLANK", 0u);
     slow_hle_threshold_ns = parse_environment_u64("PES6_SLOW_HLE_MS", 0u) * 1000000u;
+    const char *traced_library = std::getenv("PES6_TRACE_HLE_LIBRARY");
+    trace_hle_library = traced_library != nullptr ? traced_library : "";
+    trace_hle_library_lines = 0u;
     if (flight_recorder_depth != 0u || !traced_kernel_objects.empty() || trace_hle_vblank != 0u ||
+        !trace_hle_library.empty() ||
         slow_hle_threshold_ns != 0u)
         psprecomp::set_runtime_import_observer(&flight_recorder_observer);
     install_auto_dialogs(runtime);
@@ -5313,8 +5762,6 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
     alarms.clear();
     alarm_thread_busy = false;
     alarm_thread_running_vblank = false;
-    alarm_thread_running_ge = false;
-    ge_interrupt_callbacks.clear();
     pending_vblank_handlers.clear();
     vblank_interrupt_tick = 0u;
     io_async_results.clear();
@@ -5430,6 +5877,8 @@ void install_pes6_gap_hle(psprecomp::Runtime &runtime) {
                 ctx.set_gpr(2, 0x80000023u); // SCE_ERROR_INVALID_POINTER
                 return;
             }
+            // Never under a GE still drawing (pipelined) into or from VRAM.
+            if ((destination & 0x0F000000u) == 0x04000000u && !ge_async_wait_idle(rt)) return;
             std::vector<std::uint8_t> bytes(size);
             rt.memory().copy_out(source, bytes);
             rt.memory().copy_in(destination, bytes);
@@ -5731,6 +6180,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     note_ge_clut_load();
     reset_ge_transform_state(ge_state.transform);
     ge_list_table = GeListTable{};
+    ge_input_check = GeInputCheck{};
+    ge_predict_resync();
+    ge_input_check.enabled = std::getenv("PES6_GE_INPUT_CHECK") != nullptr;
     {
         std::lock_guard lock(ge_async.mutex);
         ge_async.stop_requested = false;
@@ -5738,6 +6190,12 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         ge_async.fatal_reason.clear();
         ge_async.submitted = 0u;
         ge_async.completed = 0u;
+        ge_async.skipped = 0u;
+        ge_async.commands = 0u;
+        ge_async.next_seq = 0u;
+        ge_async.predicted = 0u;
+        ge_async.unpredicted = 0u;
+        ge_async.prediction_mismatches = 0u;
         ge_async.wait_calls = 0u;
         ge_async.wait_time = std::chrono::steady_clock::duration{};
         ge_async.last_wait_ns.store(0u, std::memory_order_release);
@@ -6931,7 +7389,6 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 ctx.set_gpr(2, 0x800200D3u);  // SCE_KERNEL_ERROR_ILLEGAL_ADDR
                 return;
             }
-            ge_callback_gp = ctx.gpr[28];
             GeCallbackRecord record{
                 rt.memory().load32(callback_data + 0u),
                 rt.memory().load32(callback_data + 4u),
@@ -7015,6 +7472,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             if (ge_async_running()) {
                 ge_async_start_worker(rt);
                 bool resumed = false;
+                std::uint64_t seq = 0u;
                 {
                     std::lock_guard lock(ge_async.mutex);
                     const auto found = ge_list_table.lists.find(id);
@@ -7030,14 +7488,26 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                         auto stall = std::make_shared<std::atomic<std::uint32_t>>(new_stall);
                         ge_async.live_stalls[id] = stall;
                         found->second.state = GeListState::Queued;
-                        ge_async.pending.push_back(GeAsyncTask{id, thread_table.current_uid, stall});
+                        seq = ++ge_async.next_seq;
+                        ge_async.pending.push_back(GeAsyncTask{id, thread_table.current_uid, stall, seq, {}, false});
                         ge_async.outstanding.fetch_add(1u, std::memory_order_release);
                         ++ge_async.submitted;
+                        ++ge_async.unpredicted;
                         resumed = true;
                     }
                 }
-                if (resumed) ge_async.cv.notify_one();
-                set_success(ctx);
+                std::vector<GuestCallbackInvocation> callbacks;
+                if (resumed) {
+                    // Stalled lists are not predicted: run this part now, as
+                    // the synchronous GE does, and deliver what it raised.
+                    ge_async.cv.notify_one();
+                    if (!ge_async_wait_idle(rt)) return;
+                    callbacks = ge_async_take_callbacks(seq);
+                }
+                psprecomp::AllegrexContext resume = ctx;
+                resume.set_gpr(2, 0u);
+                resume.pc = ctx.gpr[31];
+                queue_guest_callback_chain(ctx, resume, std::move(callbacks));
                 return;
             }
 
@@ -7062,7 +7532,10 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 return;
             }
             if (ge_async_running()) {
-                if (ctx.gpr[5] == 0u && !ge_async_wait_list(rt, id)) return;
+                // A poll waits too, and for every list: what it reports and
+                // which callbacks run must not depend on how far the worker
+                // got in host time.
+                if (!ge_async_wait_idle(rt)) return;
                 std::lock_guard lock(ge_async.mutex);
                 const auto found = ge_list_table.lists.find(id);
                 if (found == ge_list_table.lists.end()) {
@@ -7088,8 +7561,13 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 return;
             }
             if (ge_async_running()) {
+                if (ctx.gpr[4] == 0u && ge_pipeline_enabled()) {
+                    ctx.set_gpr(2, 0u);
+                    return;
+                }
+                // Mode 1 (poll) waits as well, for the same reason as ListSync.
+                if (!ge_async_wait_idle(rt)) return;
                 if (ctx.gpr[4] == 0u) {
-                    if (!ge_async_wait_idle(rt)) return;
                     ctx.set_gpr(2, 0u);
                     return;
                 }
@@ -7107,6 +7585,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 (void)id;
                 state = std::max(state, ge_list_status(list));
             }
+            if (ge_input_check.enabled && ctx.gpr[4] == 0u) ge_input_seal(rt.memory());
             ctx.set_gpr(2, ctx.gpr[4] == 0u ? 0u : state);
         });
     runtime.register_hle("sceGe_user", 0xDC93CFEFu,
@@ -7142,6 +7621,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             ++ge_camera_state_revision;
             note_ge_clut_load();
             ge_state.offset_address = ge_state.commands[kGeCommandOffsetAddress] << 8u;
+            ge_predict_resync();
             set_success(ctx);
         });
 
@@ -7246,6 +7726,12 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         });
     runtime.register_hle("sceDisplay", 0x289D82FEu,
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            if (ge_input_check.enabled) ge_input_verify(rt.memory(), "setframebuf");
+            if (ge_pipeline_enabled()) {
+                if (!ge_async_wait_idle(rt)) return;
+                ge_gpu_backend_seal_recording();
+                vblanks_since_frame_buffer_set = 0u;
+            }
             const std::uint32_t address = ctx.gpr[4];
             const std::uint32_t stride = ctx.gpr[5];
             const std::uint32_t format = ctx.gpr[6];
@@ -7313,7 +7799,16 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         // The display consumes the completed GE frame.  This is a real PSP
         // visibility boundary: allow guest/GE overlap during the frame, then
         // wait only here before framebuffer presentation and vblank callbacks.
-        if (!ge_async_wait_idle(rt)) return;
+        // A pipelined GE draws the frame after the one on screen; SetFrameBuf
+        // waits for it instead.
+        if (!ge_pipeline_enabled()) {
+            if (!ge_async_wait_idle(rt)) return;
+            ge_gpu_backend_seal_recording();
+        } else if (++vblanks_since_frame_buffer_set >= 3u) {
+            // Drawing without flipping (a loading screen, say): show it anyway.
+            if (!ge_async_wait_idle(rt)) return;
+            ge_gpu_backend_seal_recording();
+        }
         ++display_vblank_index;
         pes6::audio_output_advance(virtual_time_us);
         report_realtime_speed_if_requested();
@@ -7336,7 +7831,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                     frame_time_stats.flush_time).count();
                 const GeTextureUploadTotals uploads = take_ge_texture_upload_totals();
                 const auto ge_async_wait_us = ge_async_running()
-                    ? static_cast<std::int64_t>(ge_async.last_wait_ns.load(std::memory_order_acquire) / 1000u)
+                    ? static_cast<std::int64_t>(ge_async.last_wait_ns.exchange(0u, std::memory_order_acq_rel) / 1000u)
                     : 0;
                 // In async mode ge_us is worker CPU time that overlaps Allegrex
                 // execution, so subtracting it from wall time would under-report
@@ -9040,6 +9535,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             const auto copy_start = time_movie ? std::chrono::steady_clock::now()
                                                : std::chrono::steady_clock::time_point{};
+            if (!ge_async_wait_idle(rt)) return;
             movie_output_buffers.insert(normalize_ram_address(destination));
             const std::size_t source_stride = static_cast<std::size_t>(state->second.header.width) * 4u;
             const std::size_t destination_stride = static_cast<std::size_t>(frame_width) * 4u;
@@ -10040,6 +10536,11 @@ void report_present_stats() {
     const bool async_was_running = ge_async_running();
     std::uint64_t async_submitted = 0u;
     std::uint64_t async_completed = 0u;
+    std::uint64_t async_skipped = 0u;
+    std::uint64_t async_commands = 0u;
+    std::uint64_t async_predicted = 0u;
+    std::uint64_t async_unpredicted = 0u;
+    std::uint64_t async_mismatches = 0u;
     std::uint64_t async_wait_calls = 0u;
     std::uint64_t async_wait_us = 0u;
     if (async_was_running) {
@@ -10047,11 +10548,26 @@ void report_present_stats() {
             std::lock_guard lock(ge_async.mutex);
             async_submitted = ge_async.submitted;
             async_completed = ge_async.completed;
+            async_skipped = ge_async.skipped;
+            async_commands = ge_async.commands;
+            async_predicted = ge_async.predicted;
+            async_unpredicted = ge_async.unpredicted;
+            async_mismatches = ge_async.prediction_mismatches;
             async_wait_calls = ge_async.wait_calls;
             async_wait_us = static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(ge_async.wait_time).count());
         }
         ge_async_stop_worker();
+    }
+    if (!trace_hle_library.empty()) std::cerr << trace_hle_library_buffer.str();
+    if (ge_input_check.enabled) {
+        std::cerr << "[ge-input-summary] frames_checked=" << ge_input_check.frames_checked
+                  << " frames_changed=" << ge_input_check.frames_changed;
+        for (std::size_t kind = 0; kind < kGeInputKindNames.size(); ++kind)
+            std::cerr << ' ' << kGeInputKindNames[kind] << "_frames=" << ge_input_check.changed_frames_by_kind[kind]
+                      << ' ' << kGeInputKindNames[kind] << "_bytes=" << ge_input_check.changed_bytes_by_kind[kind]
+                      << '/' << ge_input_check.watched_bytes_by_kind[kind];
+        std::cerr << "\n";
     }
     std::cerr << "[present-census] software=" << software_presents
               << " passive=" << passive_scanouts
@@ -10059,6 +10575,11 @@ void report_present_stats() {
     if (async_was_running) {
         std::cerr << "[ge-async-summary] submitted=" << async_submitted
                   << " completed=" << async_completed
+                  << " skipped=" << async_skipped
+                  << " commands=" << async_commands
+                  << " predicted=" << async_predicted
+                  << " unpredicted=" << async_unpredicted
+                  << " mismatches=" << async_mismatches
                   << " wait_calls=" << async_wait_calls
                   << " wait_us=" << async_wait_us << "\n";
     }
