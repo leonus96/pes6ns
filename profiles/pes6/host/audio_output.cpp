@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -76,6 +77,9 @@ struct AudioState {
     std::uint64_t late_frames_dropped{};
     std::uint64_t overrun_frames_dropped{};
     std::uint64_t timeline_resyncs{};
+    std::uint64_t submitted_us{};
+    std::chrono::steady_clock::time_point last_seal{};
+    std::chrono::steady_clock::duration max_seal_gap{};
 };
 
 AudioState &audio_state() {
@@ -167,7 +171,12 @@ void advance_locked(AudioState &state, std::uint64_t guest_time_us) {
     const std::uint64_t guest_frame = guest_frame_for(state, guest_time_us);
     const std::uint64_t sealed_frame =
         guest_frame > kMixSafetyFrames ? guest_frame - kMixSafetyFrames : 0u;
+    if (sealed_frame < state.output_frame + kBlockFrames) return;
     while (sealed_frame >= state.output_frame + kBlockFrames) seal_one_block(state);
+    const auto now = std::chrono::steady_clock::now();
+    if (state.last_seal != std::chrono::steady_clock::time_point{})
+        state.max_seal_gap = std::max(state.max_seal_gap, now - state.last_seal);
+    state.last_seal = now;
 }
 
 } // namespace
@@ -198,6 +207,7 @@ void audio_output_submit(std::span<const std::int16_t> pcm, std::uint32_t frames
     AudioState &state = audio_state();
     std::lock_guard<std::mutex> guard(state.mutex);
     start_locked(state);
+    state.submitted_us += static_cast<std::uint64_t>(frames) * 1000000u / source_rate;
     if (!state.timeline_anchored) {
         state.guest_anchor_us = guest_time_us;
         state.timeline_anchored = true;
@@ -263,6 +273,15 @@ void audio_output_advance(std::uint64_t guest_time_us) {
     AudioState &state = audio_state();
     std::lock_guard<std::mutex> guard(state.mutex);
     advance_locked(state, guest_time_us);
+}
+
+AudioOutputCounters audio_output_take_counters() {
+    AudioState &state = audio_state();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    const auto gap_us = std::chrono::duration_cast<std::chrono::microseconds>(state.max_seal_gap).count();
+    state.max_seal_gap = {};
+    return {state.submitted_us / 1000u, state.output_frame * 1000u / kSampleRate,
+            static_cast<std::uint64_t>(gap_us)};
 }
 
 void audio_output_reset_channel(std::uint32_t channel) {

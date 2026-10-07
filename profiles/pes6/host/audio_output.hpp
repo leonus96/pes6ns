@@ -28,6 +28,16 @@ void audio_output_advance(std::uint64_t guest_time_us);
 // Forget stream/resampler continuity for one PSP channel (release/re-reserve).
 void audio_output_reset_channel(std::uint32_t channel);
 
+// Diagnostics: running totals (ms of audio, all channels added) handed to
+// audio_output_submit and sealed toward the device, plus the longest host-time
+// gap between two seals since the previous call (which resets it).
+struct AudioOutputCounters {
+    std::uint64_t submitted_ms{};
+    std::uint64_t sealed_ms{};
+    std::uint64_t max_seal_gap_us{};
+};
+[[nodiscard]] AudioOutputCounters audio_output_take_counters();
+
 // Releases the device. Safe to call when nothing was ever opened.
 void audio_output_shutdown();
 

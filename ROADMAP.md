@@ -166,7 +166,7 @@ Seguir el patrón de tres ramas que ya usa el proyecto: `_WIN32` / `__SWITCH__` 
 - [x] CI: el workflow de la Fase 1 ahora construye `profiles/pes6` (sin datos del juego). *(job `switch-pes6-host`: `-DPES6_HOST_ONLY=ON` compila solo el host, porque `generated/` nunca está en el repo)*
 
 **DoD:** el `.nro` arranca en la consola, llega al menú y se puede jugar un partido (aunque vaya lento).
-*Estado (2026-10-06):* arranca, intro, menús al 100 % y partido jugable al ~72 % de velocidad (tirones con muchos jugadores, audio algo retrasado). Falta jugar un partido completo hasta "Resultado" para cerrar el DoD; el aviso de modo applet no se probó.
+*Estado (2026-10-06):* **DoD cumplido.** Partido completo jugado en consola hasta el final y vuelta a menús: `speed_percent` 97–100 % en juego (bajones a 85–93 % en repeticiones y transiciones), menús al 100 %. Solo queda sin probar el aviso de modo applet (el log mostró `applet type 0`: title takeover).
 
 ### Fase 6 — Rendimiento  *(2–6 semanas)*
 - [ ] Medir FPS en portátil y dock con logs por nxlink (tiempo por frame: CPU guest vs rasterizado vs presentación).
@@ -174,6 +174,7 @@ Seguir el patrón de tres ramas que ya usa el proyecto: `_WIN32` / `__SWITCH__` 
   - *Hecho:* Release (`-O3`) + `-mtune=cortex-a57` (toolchain) y `-fno-math-errno` (sin él, GCC llama a `lroundf`/`sqrtf` en la iluminación por vértice). LTO y código generado: pendiente.
 - [ ] Paralelizar el rasterizador por software (4 núcleos A57) y/o vectorizar con NEON.
 - [ ] Native fast paths (`register_native_fast_path`) para las funciones más calientes del juego.
+  - *Hecho:* `pes6_fast_paths.cpp`: `__extendsfdf2` y `__truncdfsf2` (soft-float fp-bit del juego) nativos; `pow` memoizado con los resultados del propio `pow` del juego (la libm del host difiere 1 ulp en el 3 % de las llamadas). Exactitud comprobada con `PES6_SOFT_FLOAT_FAST_PATHS=verify`. Stall antes del saque inicial: 37 → 4,5 ms en el Mac (~0,6 s → ~70 ms estimados en Switch). `PES6_SOFT_FLOAT_FAST_PATHS=0` lo desactiva.
 - [ ] Si no alcanza: **backend GE por GPU** con OpenGL ES 3 (Mesa de devkitPro) o deko3d. Permite resolución interna 2x–4x (720p portátil / 1080p dock).
   - *Hecho (adelantado por decisión del usuario tras la primera prueba en consola: el raster por CPU no da en el A57):* `ge_gpu_backend_gl.cpp`, OpenGL 3.3 core (mismo código en macOS y Switch), `PES6_RENDERER=gl`, `PES6_RENDER_SCALE`. En el Mac coincide con el software (diferencia media 2–6 niveles en menús y partido). En consola: menús al 100 %, partido ~72 % (cuello de botella: la parte CPU del GE).
   - *En curso (2026-10-06):* transformación, recorte, culling e iluminación direccional en el VS (`PSPRECOMP_GE_GPU_HW_*`, por defecto), CLUT por CLOAD y cachés por draw: GE en CPU −61 % en el Mac durante el partido (imagen idéntica a la ruta screen-space). Pendiente: medir en consola.

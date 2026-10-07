@@ -19,7 +19,7 @@
 // runs at 92 % (replays, heavy scenes) it produces 92 % of real time and a
 // fixed-rate device ran dry every ~0.5 s (a 40 ms gap each time). The feeder
 // instead resamples the FIFO at a rate steered by its smoothed fill level --
-// down to kMinRate when starving, slightly above 1 to drain excess -- so a slow
+// down to kMinRate when starving, up to kMaxRate to drain excess -- so a slow
 // stretch plays continuous, slightly lower-pitched audio that stays in step
 // with the equally slowed picture. PES6_AUDIO_RATE_CONTROL=0 turns it off.
 //
@@ -53,13 +53,17 @@ constexpr std::uint32_t kBufferFrames = 480u;  // 10 ms per audout buffer
 constexpr std::uint32_t kBuffers = 4u;
 constexpr std::uint32_t kFramesPerMs = kSampleRate / 1000u;
 constexpr std::uint32_t kPrebufferMs = 40u;
-constexpr std::uint32_t kMaxQueuedMs = 150u;
+constexpr std::uint32_t kMaxQueuedMs = 200u;
 constexpr std::size_t kFifoFrames = kMaxQueuedMs * kFramesPerMs + 4096u;
 constexpr int kThreadPriority = 0x2B;
 constexpr std::uint64_t kStatsBlocks = 470u;  // ~5 s of the mixer's 512-frame blocks
 // Rate control: FIFO frames consumed per output frame.
 constexpr std::uint32_t kTargetMs = 90u;
 constexpr double kMinRate = 0.85;
+// Above 1 it drains what the frame limiter's catch-up (frames run back to back
+// after a late one) adds. Kept small on purpose: 1.06 reached the cap on
+// nearly every 30 fps burst and the pitch audibly pumped up and down; the
+// 200 ms kMaxQueuedMs absorbs the catch-up that 1.02 drains slowly.
 constexpr double kMaxRate = 1.02;
 constexpr double kRateGain = 0.3;      // rate change per target-level of error
 constexpr double kLevelSmoothing = 0.03;  // per 10 ms buffer: ~330 ms time constant
@@ -76,6 +80,7 @@ struct DeviceState {
     double level_ms{};     // smoothed fill level
     // Statistics since the last log line (guarded by mutex).
     double min_rate{1.0};
+    double max_rate{1.0};
     std::uint64_t underruns{};
     std::uint64_t dropped_frames{};
     std::size_t min_queued{~std::size_t{0}};
@@ -135,6 +140,7 @@ void fill_buffer(DeviceState &state, AudioOutBuffer &buffer) {
                 rate = std::clamp(1.0 + kRateGain * (state.level_ms - kTargetMs) / kTargetMs,
                                   kMinRate, kMaxRate);
                 state.min_rate = std::min(state.min_rate, rate);
+                state.max_rate = std::max(state.max_rate, rate);
             }
             // Linear interpolation between FIFO frames; frame index + 1 must
             // be queued.
@@ -292,8 +298,10 @@ void audio_device_queue(const std::int16_t *samples, std::size_t frames) {
         std::cerr << "[audio-device] queued_ms min=" << state.min_queued / kFramesPerMs
                   << " max=" << state.max_queued / kFramesPerMs << " underruns=" << state.underruns
                   << " dropped_ms=" << state.dropped_frames / kFramesPerMs
-                  << " min_rate=" << static_cast<int>(state.min_rate * 100.0 + 0.5) << "%\n";
+                  << " min_rate=" << static_cast<int>(state.min_rate * 100.0 + 0.5) << "%"
+                  << " max_rate=" << static_cast<int>(state.max_rate * 100.0 + 0.5) << "%\n";
         state.min_rate = 1.0;
+        state.max_rate = 1.0;
         state.min_queued = ~std::size_t{0};
         state.max_queued = 0u;
         state.underruns = 0u;

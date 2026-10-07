@@ -8,6 +8,7 @@
 #include "pes6_hle.hpp"
 #include "pes6_runtime_log.hpp"
 #include "pes6_overlays.hpp"
+#include "pes6_fast_paths.hpp"
 #include "atrac_decoder.hpp"
 #include "media_decoder.hpp"
 #include "audio_output.hpp"
@@ -3599,6 +3600,10 @@ bool pc_profile_enabled() {
     return enabled;
 }
 std::unordered_map<std::uint64_t, std::uint64_t> pc_profile_counts;
+// Host time between the previous outer dispatch and this one, charged to this
+// dispatch: where a single dispatch chains through a long guest loop, counts
+// alone do not show the cost.
+std::unordered_map<std::uint64_t, std::uint64_t> pc_profile_host_ns;
 
 void refresh_post_dispatch_hook() {
     const bool frozen_clock_guard_needed =
@@ -3622,9 +3627,19 @@ void pes6_post_dispatch_hook(psprecomp::Runtime &rt, psprecomp::AllegrexContext 
         dispatch_thread_uid == 1)
         std::cerr << "[trace] v=" << display_vblank_index << " pc=" << psprecomp::hex32(dispatch_pc) << "\n";
     static const std::uint64_t pc_profile_start = parse_environment_u64("PES6_PC_PROFILE_START_VBLANK", 0u);
-    if (pc_profile_enabled() && display_vblank_index >= pc_profile_start)
-        ++pc_profile_counts[(static_cast<std::uint64_t>(static_cast<std::uint32_t>(dispatch_thread_uid)) << 32u) |
-                            dispatch_pc];
+    if (pc_profile_enabled()) {
+        static std::chrono::steady_clock::time_point previous{};
+        const auto now = std::chrono::steady_clock::now();
+        if (display_vblank_index >= pc_profile_start) {
+            const std::uint64_t key =
+                (static_cast<std::uint64_t>(static_cast<std::uint32_t>(dispatch_thread_uid)) << 32u) | dispatch_pc;
+            ++pc_profile_counts[key];
+            if (previous != std::chrono::steady_clock::time_point{})
+                pc_profile_host_ns[key] += static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(now - previous).count());
+        }
+        previous = now;
+    }
     if (execution_clock_dispatch_interval == 0u && frozen_clock_guard_limit != 0u) {
         const bool has_delayed_thread = std::any_of(
             thread_table.threads.begin(), thread_table.threads.end(), [](const auto &item) {
@@ -3690,6 +3705,8 @@ struct FrameTimeStats {
     std::chrono::steady_clock::time_point last_vblank{};
     std::uint64_t ge_calls{};
     std::uint64_t last_guest_time{};
+    AudioOutputCounters last_audio{};
+    std::uint64_t last_passive_scanouts{};
     bool started{};
 };
 FrameTimeStats frame_time_stats;
@@ -7333,15 +7350,22 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 const std::int64_t guest_cpu_us =
                     frame_us > accounted_non_guest ? frame_us - accounted_non_guest : 0;
                 // One line for any vblank that took far longer than a period:
-                // the stall the player sees (scene changes, loads).
-                if (frame_us > 150000) {
+                // the stall the player sees (scene changes, loads).  Also on
+                // guest time, so the same vblanks show up on a faster host.
+                const AudioOutputCounters audio = audio_output_take_counters();
+                const std::uint64_t guest_delta_us = virtual_time_us - frame_time_stats.last_guest_time;
+                if (frame_us > 150000 || guest_delta_us > 150000u) {
                     std::ostringstream stall_line;
                     stall_line << "[stall] vblank=" << display_vblank_index << " frame_us=" << frame_us
                                << " ge_us=" << ge_us << " tex_uploads=" << uploads.uploads
                                << " tex_upload_us=" << uploads.ns / 1000u << " flush_us=" << flush_us
                                << " present_us=" << present_us << " io_us=" << io_us
                                << " guest_cpu_us=" << guest_cpu_us
-                               << " guest_us=" << virtual_time_us - frame_time_stats.last_guest_time << "\n";
+                               << " guest_us=" << guest_delta_us
+                               << " audio_in_ms=" << audio.submitted_ms - frame_time_stats.last_audio.submitted_ms
+                               << " audio_sealed_ms=" << audio.sealed_ms - frame_time_stats.last_audio.sealed_ms
+                               << " audio_max_gap_us=" << audio.max_seal_gap_us
+                               << " passive=" << passive_scanouts - frame_time_stats.last_passive_scanouts << "\n";
                     write_diag_line(stall_line);
                 }
                 // PSPRECOMP_FRAME_TIME_INTERVAL=N (N > 1): one [frame-time-avg]
@@ -7501,6 +7525,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             frame_time_stats.started = true;
             frame_time_stats.last_vblank = now;
             frame_time_stats.last_guest_time = virtual_time_us;
+            frame_time_stats.last_audio = audio_output_take_counters();
+            frame_time_stats.last_passive_scanouts = passive_scanouts;
             frame_time_stats.ge_time = std::chrono::steady_clock::duration{};
             frame_time_stats.present_time = std::chrono::steady_clock::duration{};
             frame_time_stats.flush_time = std::chrono::steady_clock::duration{};
@@ -9963,6 +9989,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             ctx.set_gpr(2, static_cast<std::uint32_t>(read));
         });
     install_pes6_gap_hle(runtime);
+    install_soft_float_fast_paths(runtime);
 }
 
 
@@ -10070,12 +10097,13 @@ void report_thread_state() {
         std::cout << "\n";
     }
     if (pc_profile_enabled()) {
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> top(pc_profile_counts.begin(), pc_profile_counts.end());
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> top(pc_profile_host_ns.begin(), pc_profile_host_ns.end());
         std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
         if (top.size() > 40u) top.resize(40u);
-        for (const auto &[key, count] : top)
+        for (const auto &[key, ns] : top)
             std::cout << "[pc-profile] uid=" << static_cast<std::int32_t>(key >> 32u)
-                      << " pc=" << psprecomp::hex32(static_cast<std::uint32_t>(key)) << " dispatches=" << count << "\n";
+                      << " pc=" << psprecomp::hex32(static_cast<std::uint32_t>(key))
+                      << " dispatches=" << pc_profile_counts[key] << " host_us=" << ns / 1000u << "\n";
     }
     for (const auto &[uid, entries] : flight_recorder) {
         for (const FlightEntry &entry : entries)
